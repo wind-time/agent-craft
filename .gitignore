@@ -1,0 +1,37 @@
+# 自述：依赖与开发说明
+/README.md
+
+# 依赖
+node_modules/
+
+# 构建产物
+dist/
+dist-ssr/
+
+# Astro 生成类型
+.astro/
+
+# Pagefind 索引（构建时生成）
+public/pagefind
+
+# 环境变量与密钥
+.env
+.env.*
+!.env.example
+
+# 编辑器/系统
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.log
+npm-debug.log*
+
+# Python（交互式 Demo 运行时，如后续接入）
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# pnpm
+.pnpm-store
