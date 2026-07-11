@@ -7,7 +7,8 @@
   --color-muted: var(--muted);
   --color-muted-foreground: var(--muted-foreground);
   --color-border: var(--border);
-  --font-app: var(--font-google-sans-code);
+  --font-app: ui-monospace, "Cascadia Code", "Source Code Pro", Menlo,
+    Consolas, monospace;
 }
 
 /* Light theme values */
