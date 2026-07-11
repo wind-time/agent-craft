@@ -1,6 +1,11 @@
 # 依赖
 node_modules/
 
+# 作者内部文档（仅本地保留，不进 git，连历史也不能出现）
+# 这些是给作者/Claude 看的，面向读者的公开仓库不应包含
+CLAUDE.md
+docs/
+
 # 构建产物
 dist/
 dist-ssr/
