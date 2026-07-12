@@ -12,6 +12,7 @@ const posts = defineCollection({
       author: z.string().default(config.site.author),
       pubDatetime: z.date(),
       modDatetime: z.date().optional().nullable(),
+      series: z.string().default("agent-fundamentals"),
       chapter: z.number().optional(),
       title: z.string(),
       featured: z.boolean().optional(),

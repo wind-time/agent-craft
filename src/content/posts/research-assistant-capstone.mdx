@@ -1,0 +1,194 @@
+---
+title: "第 10 章 · 综合案例与进阶路线：从裸 LLM 到生产级 Agent"
+pubDatetime: 2026-07-12T00:00:00Z
+chapter: 10
+featured: false
+draft: false
+tags: [agent, 综合案例, 进阶路线]
+description: "前 9 章我们一块块学完了 LangChain 全家桶。本章把它们串起来——做一个综合案例，用上记忆、文件系统、任务规划、子 Agent、Skills，再用一张知识地图回顾演进主线，最后指明进阶方向。Agent 入门开发专题收尾。"
+---
+
+import AgentDemoButton from "@/components/_interactive/AgentDemoButton.tsx";
+
+> 前 9 章我们一块块学完了：心智模型 → LangChain 地基 → 手搓 ReAct → LangGraph → create_agent → Deep Agents（文件系统/子 Agent/记忆/Skills）→ 框架横评。本章是「Agent 入门开发」专题的收尾——把这些能力串成一个综合案例，用知识地图回顾主线，再指明进阶方向。
+
+## 综合案例：个人研究助理
+
+学了一堆能力，到底能做出什么？我们做一个「个人研究助理」——用户让它调研两个主题写对比报告，它要综合用上前 6-8 章的全部能力。
+
+### 任务设定
+
+```text
+用户偏好（已记忆）：TypeScript、回复简短
+任务：调研 LangGraph 和 Deep Agents，写一份对比报告，用 TypeScript 风格
+```
+
+### Agent 配置
+
+```python
+from deepagents import create_deep_agent, SubAgent
+from deepagents.backends import CompositeBackend, StateBackend, StoreBackend
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.store.memory import InMemoryStore
+
+def internet_search(query: str) -> str:
+    """搜索网络内容。"""
+    return f"关于 {query} 的搜索结果……"
+
+# 研究子 Agent：负责调研，上下文隔离
+research_subagent = SubAgent(
+    name="research-agent",
+    description="用于深入研究型问题，擅长查资料并总结",
+    system_prompt="你是一个研究员，调研后输出简洁摘要。",
+    tools=[internet_search],
+)
+
+# 后端：/memories/ 跨会话持久，其他临时
+backend = CompositeBackend(
+    default=StateBackend(),
+    routes={"/memories/": StoreBackend(namespace=lambda rt: (rt.server_info.user.identity,))},
+)
+
+agent = create_deep_agent(
+    model="openai:your-model-name",
+    subagents=[research_subagent],          # 子 Agent 委派
+    backend=backend,                        # 文件系统 + 记忆持久化
+    memory=["/memories/AGENTS.md"],         # 长期记忆
+    skills=["/skills/"],                    # Skills 能力包（含 report-writer）
+    system_prompt="你是个人研究助理。调研用子 Agent，资料存文件，写报告用 report-writer skill。",
+    checkpointer=InMemorySaver(),           # 短期：thread 内状态
+    store=InMemoryStore(),                  # 长期：跨会话记忆
+)
+```
+
+### 运行轨迹
+
+<AgentDemoButton client:visible demoId="research-assistant-capstone" label="运行：个人研究助理综合案例" />
+
+上面的 Demo 回放了 Agent 处理这个任务的完整轨迹。注意它如何把前 9 章的能力协同用上：
+
+| 阶段 | 用到的能力 | 第几章学的 |
+|---|---|---|
+| 启动加载用户偏好 | 长期记忆 + StoreBackend | 第 8 章 |
+| 拆解任务 | `write_todos` 任务规划 | 第 7 章 |
+| 调研两个主题 | 子 Agent 委派 + Context Quarantine | 第 7 章 |
+| 存调研资料 | 虚拟文件系统外置 | 第 6 章 |
+| 写报告 | Skills 按需加载（report-writer） | 第 8 章 |
+| 取回资料综合 | `read_file` 按需读取 | 第 6 章 |
+| 偏好生效（TypeScript/简短） | 记忆自动注入 system prompt | 第 8 章 |
+
+```python
+result = agent.invoke(
+    {"messages": [{"role": "user", "content": "调研 LangGraph 和 Deep Agents，写对比报告，用 TypeScript 风格"}]},
+    config={"configurable": {"thread_id": "research-1"}},
+)
+# Agent 自主执行（对应 Demo 轨迹）：
+# 1. 启动：加载 /memories/AGENTS.md → 偏好「TypeScript、简短」进 prompt
+# 2. write_todos 拆成 3 项
+# 3. task(description="调研 LangGraph", subagent_type="research-agent")
+#    → 子 Agent 内部 3 轮 search（2000+ token 隔离）→ 回传 200 token 摘要
+# 4. task 调 Deep Agents（同样隔离）
+# 5. write_file 两份摘要到 /research/（主上下文干净）
+# 6. 识别写报告 → read_file /skills/report-writer/SKILL.md（L2 加载指令）
+# 7. 按 skill 指令 read_file 取回资料 → 写对比报告
+# 8. 输出（TypeScript 风格、简短——偏好生效）
+```
+
+### 为什么这个案例重要
+
+注意整个过程中**主 Agent 的上下文始终干净**——这是前 9 章能力的协同效果：
+
+- 调研的 2000+ token 中间消息 → 子 Agent 隔离，不进主上下文
+- 两份摘要 → 文件系统外置，不堆在 messages
+- 用户偏好 → 记忆自动加载，不用每次重说
+- 写报告的指令 → Skills 按需加载，启动只占一行元数据
+
+如果用第 3 章的裸 ReAct 跑同样的任务，主上下文早被原始资料塞爆了。**这就是从「能跑的 Demo」到「能扛长任务的 Agent」的距离**——前 9 章一步步走的路。
+
+## 知识地图：从裸 LLM 到生产级 Agent
+
+回顾这 9 章的演进主线，它是一条清晰的「能力累加」路径：
+
+```text
+第 1 章  裸 LLM 调用
+        ↓ 痛点：无外部能力、无状态、无记忆
+第 2 章  + init_chat_model / @tool / bind_tools（LangChain 地基）
+        ↓ 能调工具了，但只跑单轮
+第 3 章  + 手搓 ReAct while 循环
+        ↓ 痛点：上下文膨胀、状态丢失、模型不听话
+第 4 章  + StateGraph + Checkpointer（LangGraph Runtime）
+        ↓ 解决状态丢失，能时间旅行
+第 5 章  + create_agent + Middleware（Framework 层）
+        ↓ 开箱即用 + HITL 审批 + 流式
+第 6 章  + 虚拟文件系统（Deep Agents Harness）
+        ↓ 解决上下文膨胀，资料外置
+第 7 章  + write_todos + 子 Agent（Context Quarantine）
+        ↓ 复杂任务拆解 + 上下文隔离
+第 8 章  + 长期记忆 + Skills
+        ↓ 跨会话沉淀 + 能力复用
+第 9 章  框架横评
+        ↓ 知道何时用 Deep Agents、何时选别的
+```
+
+对应回第 1 章的「三个层次」：
+
+| 层次 | 角色 | 本专题章节 |
+|---|---|---|
+| **Runtime** | LangGraph：状态图、检查点、流式 | 第 4-5 章 |
+| **Framework** | `create_agent`：预置 ReAct + middleware | 第 2-5 章 |
+| **Harness** | Deep Agents：文件系统、子 Agent、记忆、Skills | 第 6-8 章 |
+
+第 1 章我们说「Agent ≠ LLM + while 循环」，循环只是「形」，真正让它成立的是工具、状态、终止与失败恢复的工程化处理。这 9 章就是把这个论断一步步证实的过程——每一章都在循环之上加一层工程能力，直到它能扛住真实的长任务。
+
+## 进阶指路
+
+「Agent 入门开发」专题到此收尾。你现在已经能：用 LangChain 接模型调工具、用 LangGraph 画状态图做持久化、用 Deep Agents 做生产级长任务。但 Agent 的世界远不止于此——后续还有这些专题：
+
+### Agent 部署与容器化
+
+把 Agent 从「本地能跑」变成「线上服务」。内容：
+
+- **Docker 容器化**：把 Agent + 依赖打包成镜像，环境隔离、可复现
+- **流式后端**：FastAPI + SSE，把 Agent trace 流式推给前端（呼应本站交互式文章的实现）
+- **部署路径选型**：LangGraph Platform / 自建 FastAPI / Serverless，对比成本与复杂度
+- **生产可观测**：LangSmith trace 在生产的作用，定位失败请求
+- **安全护栏**：工具权限、循环上限、API key 管理、限流防刷
+
+### Agent 进阶编排
+
+复杂场景下的编排能力。内容：
+
+- **复杂状态机**：多节点自定义工作流，不止 ReAct
+- **HITL 深入**：人机协作的多种模式（审批、修正、接管）
+- **多 Agent 协作模式**：层级、对话、竞争、协作
+- **长任务工程**：超长任务的断点续跑、任务分片
+
+### 模型微调
+
+为 Agent 微调专属模型。内容：
+
+- **LoRA / QLoRA**：低成本微调大模型
+- **数据准备**：构造工具调用训练数据
+- **评测**：怎么衡量微调后 Agent 变强了
+- **为 Agent 微调**：让模型更会调工具、更会规划
+
+### 其他框架实战
+
+横评（第 9 章）的展开。内容：
+
+- **CrewAI 实战**：角色协作的深入用法
+- **AG2 实战**：对话式多 Agent 的新 network API
+- **OpenAI Agents SDK**：Handoff + Guardrail + voice agent
+- **Google ADK**：企业级部署 + 五语言
+
+每个专题会像本专题一样，从认知到实战、循序渐进。关注本站，后续陆续更新。
+
+## 小结
+
+1. **综合案例串起全部能力**：个人研究助理用上记忆、文件系统、任务规划、子 Agent、Skills，主上下文始终干净——这是前 9 章协同的效果，裸 ReAct 做不到。
+2. **演进主线清晰**：从裸 LLM（无能力）→ 地基 API（能调工具）→ ReAct 循环（多轮）→ LangGraph（持久化）→ create_agent（开箱即用）→ Deep Agents（上下文工程）——每章加一层工程能力。
+3. **三个层次对应**：Runtime（LangGraph）/ Framework（create_agent）/ Harness（Deep Agents），第 1 章的抽象在第 10 章落地为具体技术栈。
+4. **入门到此为止**：你能用 LangChain 全家桶做生产级长任务 Agent。后续专题往部署、进阶编排、微调、其他框架方向深入。
+5. **本专题是起点不是终点**：Agent 的世界很大，这只是「入门开发」。保持学习，持续沉淀——这也是本博客存在的意义。
+
+> 「Agent 入门开发」专题完结。感谢读到这里。后续专题会陆续上线——部署、进阶编排、微调、其他框架。如果你顺着这 10 章走下来，已经具备了做真实 Agent 项目的基础。下一步，就是把它们部署上线、扛住真实流量——那是下一个专题的故事。
