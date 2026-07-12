@@ -1,0 +1,203 @@
+---
+title: "第 9 章 · Agent 框架横评：CrewAI / AG2 / OpenAI Agents SDK / Google ADK 怎么选"
+pubDatetime: 2026-07-12T00:00:00Z
+chapter: 9
+featured: false
+draft: false
+tags: [agent, 框架横评, crewai, openai-agents]
+description: "前 8 章我们深挖了 LangChain 全家桶。本章拉到生态视野，横向对比 CrewAI / AG2（原 AutoGen）/ OpenAI Agents SDK / Google ADK 四个主流框架，给一张「什么场景该选哪个」的决策表——也回头看清 LangChain 这套的差异化。"
+---
+
+import AgentDemoButton from "@/components/_interactive/AgentDemoButton.tsx";
+
+> 前 8 章我们深挖了 LangChain + LangGraph + Deep Agents 这一套，从手搓 ReAct 一路到长期记忆。但生态里不止这一家。本章拉到视野高处，横向对比 CrewAI / AG2 / OpenAI Agents SDK / Google ADK 四个主流框架，看清各自的定位与适用场景——也回头审视我们这套的差异化。
+
+## 先认清一个事实：没有「最好的框架」
+
+每次有人问「学哪个 Agent 框架」，答案都是「看场景」。这不是和稀泥——Agent 框架的抽象差异很大，**为不同任务形态而生**：
+
+- 客服 triage 路由 → 需要 Agent 间快速委派
+- 研究→写作→评审流水线 → 需要角色分工 + 流程控制
+- 多 Agent 辩论 → 需要对话式协作
+- 长任务深度研究 → 需要上下文工程
+
+为「辩论」设计的框架硬塞「流水线」，就像用对话录做工程管线——能跑但别扭。本章帮你把任务形态和框架抽象对上号。
+
+> 一个时间线先建立脉络：2024-11 AutoGen 演化为 AG2；2025-03 OpenAI Agents SDK 和 Google ADK 相继首发；2025-05 Google ADK 1.0；2026-05 Google ADK 2.0（破坏性升级）。生态这两年洗牌很快，**以最新文档为准**，旧教程常对不上。
+
+## 四个框架速览
+
+### CrewAI：角色驱动的多 Agent 协作
+
+**版本**：1.15.2（2026-07）。**与 LangChain 完全独立**（PyPI 明确声明，不是基于 LangChain）。
+
+核心抽象四个一等公民：
+
+| 抽象 | 作用 |
+|---|---|
+| **Agent** | 带 `role` / `goal` / `backstory` 的角色化 worker |
+| **Task** | 分配给 Agent 的工作单元，有 `expected_output` |
+| **Crew** | 协作的「团队」，承接任务，按 `Process`（sequential/hierarchical）跑 |
+| **Flow** | 事件驱动的「管理者」，管状态、条件分支、循环，Crew 嵌入 Flow 步骤里 |
+
+```python
+from crewai import Agent, Crew, Task, Process
+
+researcher = Agent(
+    role="Researcher",
+    goal="Gather information on market dynamics",
+    backstory="A diligent researcher with a keen eye for detail",
+)
+research_task = Task(
+    description="Research factors affecting market dynamics.",
+    expected_output="An analysis of factors influencing the market.",
+    agent=researcher,
+)
+crew = Crew(agents=[researcher], tasks=[research_task], process=Process.sequential)
+result = crew.kickoff()
+```
+
+**定位**：角色分工明确的多 Agent 流程（研究→写作→评审）、企业自动化。生产建议「从 Flow 开始」，Crew 嵌入做创造性多智能体活。单 Agent 简单循环用它是杀鸡用牛刀。
+
+### AG2（原 AutoGen）：对话式多 Agent
+
+**版本**：0.14.0（1.0.0b0 预发布）。2024-11 AutoGen 演化为 AG2，AG2AI 开放治理。
+
+核心抽象正在换代——这是横评要特别点明的：
+
+- **经典 API**（仍可用）：`ConversableAgent` + `GroupChat` + `GroupChatManager`
+- **新 API**（官方力推）：`ag2.network` 模块的 `Hub` + `TransitionGraph` + channel，声明式、JSON 可序列化的转场图
+
+```python
+import asyncio
+from ag2 import Agent
+from ag2.config import OpenAIConfig
+
+agent = Agent("assistant", prompt="You are a helpful assistant.", config=OpenAIConfig("gpt-4o-mini"))
+
+async def main():
+    reply = await agent.ask("Give me one sentence about AG2.")
+    print(reply.body)
+    reply2 = await reply.ask("Tell me more.")   # 续聊
+
+asyncio.run(main())
+```
+
+**定位**：自称「The Open-Source AgentOS」——多 Agent 对话/辩论/协作、人机无缝协作。新 network API 提供可重放与治理能力。**老教程的 `ConversableAgent` 写法和新文档对不上**，学的时候认准 `ag2.network`。
+
+### OpenAI Agents SDK：Handoff + Guardrail，绑 OpenAI
+
+**版本**：0.18.2。2025-03 首发（不是旧的实验性 Swarm，Swarm 已停更）。OpenAI 官方，MIT。
+
+官方原话「very small set of primitives」——五个原语：
+
+| 原语 | 作用 |
+|---|---|
+| **Agent** | 带 instructions 和 tools 的 LLM 配置 |
+| **Tool** | Python 函数自动生成 schema，原生支持 MCP |
+| **Handoff** | Agent 间委派，对模型表现为 `transfer_to_X_agent` tool |
+| **Guardrail** | 输入/输出校验，与执行并行，fail fast |
+| **Runner** | 驱动 agent loop |
+
+```python
+from agents import Agent, Runner
+
+agent = Agent(name="Assistant", instructions="You are a helpful assistant")
+result = Runner.run_sync(agent, "Write a haiku about recursion.")
+print(result.final_output)
+```
+
+**定位**：已选 OpenAI 模型栈、客服式 triage 路由、voice/realtime agent。**默认深度绑 OpenAI Responses API**（tracing 默认回传 OpenAI），非 OpenAI 模型靠 LiteLLM/Any-LLM 适配器（beta）解锁。要严格厂商中立就别选它。
+
+### Google ADK：企业级，五语言，一键部署
+
+**版本**：2.4.0。2025-03 首发，2025-05 1.0，2026-05 2.0（破坏性升级 agent API/event/session schema）。
+
+显著特点：**Python / TypeScript / Go / Java / Kotlin 五端齐发**。核心抽象：Agent + Tool + Session/State/Memory 一等公民 + 2.0 的 Graph Workflows（确定性代码与 AI 推理织进同一张图）。
+
+```python
+from google.adk import Agent
+from google.adk.tools import google_search
+
+agent = Agent(
+    name="researcher",
+    model="gemini-flash-latest",
+    instruction="You help users research topics thoroughly.",
+    tools=[google_search],
+)
+# 运行：adk run my_agent 或 adk web
+```
+
+**定位**：官方原话「Build production agents, not prototypes」——企业级，一键部署到 Cloud Run / GKE / Agent Runtime。默认 Gemini 但不锁定（支持 Claude/开源）。**2.0 是破坏性升级，1.x 教程不能直接套**。
+
+## 同一任务，三种抽象
+
+光看 API 不直观。用「客服 triage：把用户路由到 billing/refund 两个专用 Agent」这个同一任务，看三个框架各用什么抽象表达：
+
+<AgentDemoButton client:visible demoId="framework-comparison" label="运行：同一 triage 任务在三个框架里的抽象对比" />
+
+上面的 Demo 并排展示了三种风格：
+
+- **OpenAI Agents SDK**：`Agent(handoffs=[billing, refund])`——Handoff 原语，模型自己决定 `transfer_to_X_agent`
+- **CrewAI**：`Agent(role=...)` + `Task(agent=...)` + `Crew(process=sequential)`——角色 + 任务 + 团队
+- **LangChain + Deep Agents**：`SubAgent(...)` + `create_deep_agent(subagents=[...])`——声明式子 Agent，主 Agent 用 `task` 工具委派
+
+同一个「路由」需求，三个框架用了完全不同的抽象。**选型本质是选抽象**——哪个抽象最贴合你的任务形态，代码就最自然。
+
+## 横向对比表
+
+| 维度 | CrewAI | AG2 | OpenAI Agents SDK | Google ADK | LangChain全家桶 |
+|---|---|---|---|---|---|
+| **多 Agent 协作** | 强（Crew+Flow） | 极强（Hub/TransitionGraph） | 中（Handoff 路由） | 强（2.0 graph） | 强（LangGraph 图+子 Agent） |
+| **单 Agent 复杂度** | 中（抽象略重） | 中（对话式） | 高（Runner+Guardrail） | 高（Session+Context） | 极高（Deep Agents 全套） |
+| **学习曲线** | 低-中 | 中-高（新 network API） | 低（5 原语） | 中 | 高（三层栈） |
+| **生产成熟度** | 高（企业定位） | 中（1.0 仍 beta） | 中-高（OpenAI 背书） | 高（一键 Cloud Run） | 高（LangSmith 可观测） |
+| **模型绑定** | 无 | 无 | 默认 OpenAI | 默认 Gemini | 无（`init_chat_model`） |
+| **上下文工程** | 弱 | 中 | 弱-中 | 强（自动摘要/lazy-load） | 极强（虚拟 FS+Skills） |
+| **许可证** | MIT | Apache-2.0 | MIT | Apache-2.0 | MIT |
+
+## 选型决策表
+
+对号入座：
+
+| 你的场景 | 选哪个 | 理由 |
+|---|---|---|
+| 已选 OpenAI 模型、客服 triage / voice agent | **OpenAI Agents SDK** | Handoff+Guardrail+tracing 闭环最顺，realtime 是独门 |
+| 角色分工明确的多 Agent 流程（研究→写作→评审） | **CrewAI** | Crew+Flow 就为这类设计，角色抽象直觉好 |
+| 多 Agent 对话/辩论、人机协作、要可重放治理 | **AG2** | 对话式协作是基因，Hub/TransitionGraph 提供审计 |
+| Google 生态、要五语言一致、一键部署 Cloud Run | **Google ADK** | 企业部署最省事，2.0 graph 兼顾确定性与 AI |
+| 长任务、深度上下文工程（文件系统/子 Agent/Skills） | **Deep Agents** | 这是它相对其他四个的核心差异化 |
+| 要最大灵活度、厂商中立、自己掌控图编排 | **LangGraph + create_agent** | 基础设施最扎实，可裁剪可扩展 |
+| 单 Agent 简单工具循环 | **别上框架** | 裸 `bind_tools` + while 就够（第 3 章立意） |
+
+## 回头看 LangChain 全家桶的差异化
+
+横评完，能看清我们前 8 章这套的独特价值——**分层最完整**：
+
+```text
+LangGraph（Runtime：图、持久化、流式、HITL 基建）
+    ↑
+langchain.agents.create_agent（Framework：预置 agent loop + middleware）
+    ↑
+deepagents.create_deep_agent（Harness：文件系统、子 Agent、记忆、Skills）
+```
+
+其他四个框架多是「一层打通」——要么专注多 Agent 协作（CrewAI/AG2），要么绑厂商做开箱即用（OpenAI/Google）。LangChain 这套是**三层都可单独用、也可叠加**：
+
+- 只想画状态图 → 用 LangGraph
+- 想要预置 ReAct loop → 用 `create_agent`
+- 要生产级长任务执行体 → 用 Deep Agents
+
+而且**任何 `CompiledStateGraph` 都能作为 Deep Agent 的子 Agent**（第 7 章讲过）——这意味着你可以把一个 CrewAI 的 Crew、或一个 OpenAI Agent 包成子图喂给 Deep Agent。这种可组合性是其他框架没有的。
+
+> 代价是学习曲线最陡——三层栈概念最厚。但如果你要做的是**长任务、要深度上下文工程**，这层投入值得，因为别的框架在这块是短板。
+
+## 小结
+
+1. **没有最好的框架，只有最贴合任务形态的抽象**。选型本质是选抽象——客服路由用 Handoff、流水线用 Crew、辩论用 GroupChat、长任务用 Deep Agents。
+2. **四个框架各有基因**：CrewAI（角色协作，独立于 LangChain）/ AG2（对话式，API 正换代到 network）/ OpenAI Agents SDK（5 原语，绑 OpenAI）/ Google ADK（企业级，五语言，2.0 破坏性升级）。
+3. **生态洗牌快**：AutoGen→AG2、OpenAI Swarm→Agents SDK、ADK 2.0 破坏性升级——以最新文档为准，旧教程常对不上。
+4. **LangChain 全家桶的差异化是分层完整 + 可组合**：LangGraph / create_agent / Deep Agents 三层可单独用可叠加，任何 CompiledStateGraph 能当子 Agent。代价是学习曲线最陡。
+5. **单 Agent 简单循环别上框架**——呼应第 3 章手搓 ReAct，框架是为复杂场景准备的，简单需求裸 `bind_tools` 就够。
+
+> 下一章是实战压轴——把 Agent 部署上线。从「能跑的 Demo」到「生产服务」：流式前端如何渲染 trace、部署路径怎么选（LangGraph Platform / 自建 FastAPI / Serverless）、模型选择策略、LangSmith 可观测。第 10 章还会配上一个**真实可运行的交互式 Demo**——读者点按钮真跑一个 Agent，不再是预录回放。
