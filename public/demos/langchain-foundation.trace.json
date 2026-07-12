@@ -1,0 +1,43 @@
+{
+  "demoId": "langchain-foundation",
+  "variants": [
+    {
+      "id": "bare",
+      "label": "未绑定工具的模型",
+      "steps": [
+        {
+          "type": "thought",
+          "content": "模型未绑定工具，遇到「北京今天天气」只能凭训练数据概率生成一段文字。"
+        },
+        {
+          "type": "output",
+          "content": "北京今天晴，气温约 20°C。",
+          "note": "无数据依据，模型概率生成——气温、天气都可能完全错误。"
+        }
+      ]
+    },
+    {
+      "id": "with-tools",
+      "label": "bind_tools 后的模型",
+      "steps": [
+        {
+          "type": "thought",
+          "content": "模型识别出需要实时天气信息，决定调用 get_weather 工具，而非直接编造答案。"
+        },
+        {
+          "type": "tool_call",
+          "toolName": "get_weather",
+          "content": "get_weather(city=\"北京\")  # tool_call_id=call_1"
+        },
+        {
+          "type": "thought",
+          "content": "代码执行 get_weather → 返回：「晴，28°C，北风 3 级」，作为 ToolMessage 回填进 messages。"
+        },
+        {
+          "type": "output",
+          "content": "北京今天晴，28°C，北风 3 级。适合户外活动。"
+        }
+      ]
+    }
+  ]
+}

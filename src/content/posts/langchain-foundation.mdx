@@ -1,0 +1,305 @@
+---
+title: "LangChain 入门：模型调用、工具绑定与一次完整的 Tool Call"
+pubDatetime: 2026-07-12T00:00:00Z
+featured: false
+draft: false
+tags: [agent, langchain, tool-call]
+description: "所有上层 Agent 框架的地基都是这套：用 init_chat_model 接模型、@tool 定义工具、bind_tools 把工具交给模型。本文用一个最小例子把三块地基和一次完整 tool call 闭环亲手敲一遍。"
+---
+
+import AgentDemoButton from "@/components/_interactive/AgentDemoButton.tsx";
+
+> 上一章我们建立了 Agent 的心智模型——Agent 比 LLM 多了工具、循环、状态。本章进入实操，用 LangChain 把三块地基亲手敲一遍：接模型、定义工具、让模型真正调用工具。
+
+## 这三块地基为什么重要
+
+第 1 章讲过，Agent 的「大脑」是 LLM，「手脚」是工具。但你不会直接拿裸 OpenAI SDK 去拼 Agent——那样每个模型提供商的接口差异、每个工具的参数校验、每次消息的拼装都要自己写。
+
+LangChain 把这些抽成了三块地基 API，后面所有上层方案（LangGraph 的 StateGraph、Deep Agents 的 `create_deep_agent`）都长在这套地基上：
+
+| 地基 API | 解决什么 | 类比 |
+|---|---|---|
+| `init_chat_model` | 统一模型接入，换提供商只改一行 | 万能插座 |
+| `@tool` | 把普通函数变成模型可调用的工具 | 给手脚装「接口」 |
+| `bind_tools` | 把工具列表交给模型，让它知道「我能调什么」 | 给大脑发一份工具清单 |
+
+本章用一个最小例子把三块串起来，最后跑通一次完整的 tool call 闭环。
+
+## 环境准备
+
+### 安装依赖
+
+```bash
+# pip
+pip install langchain langchain-openai langchain-core
+
+# uv（推荐，速度更快）
+uv pip install langchain langchain-openai langchain-core
+```
+
+Python 版本要求 3.10+。
+
+### 模型接入
+
+本文示例用任意 **兼容 OpenAI 接口**的模型提供商即可——你只要拿到 `base_url`、`api_key`、`model_name` 三样东西就能跑。常见的兼容端点：硅基流动、DeepSeek、智谱、OpenAI 官方等。
+
+用环境变量管理密钥和模型名，**不要写死在代码里**：
+
+```bash
+# .env
+API_KEY=sk-xxxxxxxx
+BASE_URL=https://your-provider.com/v1
+MODEL_NAME=your-model-name
+```
+
+> 💡 **模型版本说明**：入门示例用任意支持 function calling 的模型即可。但任务规划、多子 Agent 编排等复杂场景，小模型往往无法稳定跑通 tool call，请改用能力更强的模型。平台模型会不定期上下线，建议用 `MODEL_NAME` 环境变量管理。
+
+> 本文代码基于 **LangChain 1.3.x**。1.0 起已废弃 `AgentExecutor` / `ConversationChain`，本文用的是更底层的 `bind_tools` 手写循环写法——这是为第 3 章「手搓 ReAct」做铺垫，故意不用高层封装。
+
+## 第一块地基：`init_chat_model` 接模型
+
+### 为什么不直接用 `ChatOpenAI`
+
+你可以直接 `from langchain_openai import ChatOpenAI`，但那样换提供商（比如从 OpenAI 换到 Anthropic）要改 import、改类名、改参数。`init_chat_model` 把这层差异抹平了——一个函数、传 `model_provider`，底层自动选对应的 provider 类。
+
+```python
+import os
+from dotenv import load_dotenv
+from langchain.chat_models import init_chat_model
+
+load_dotenv()
+
+# 前缀 "openai:" 决定走 langchain_openai.ChatOpenAI
+# base_url / api_key 作为 kwargs 透传到底层 provider，接任意 OpenAI 兼容端点
+model = init_chat_model(
+    f"openai:{os.environ['MODEL_NAME']}",
+    base_url=os.environ["BASE_URL"],
+    api_key=os.environ["API_KEY"],
+    temperature=0,
+)
+
+# 最朴素的调用：问一句，答一句，没有工具
+response = model.invoke("用一句话解释什么是 Agent")
+print(response.text)
+```
+
+跑起来，模型会返回一段文字。注意这时候模型**没有任何外部能力**——它不知道实时天气、不会算数、不能查数据库，只是在概率上生成像答案的文字。这正是第 1 章说的「裸 LLM 调用」的局限。
+
+### `AIMessage` 长什么样
+
+`model.invoke()` 返回的不是字符串，而是一个 `AIMessage` 对象。记住这个结构，后面工具调用就靠它：
+
+```python
+ai_msg = model.invoke("你好")
+print(type(ai_msg))          # AIMessage
+print(ai_msg.text)           # 模型生成的文字
+print(ai_msg.tool_calls)     # [] —— 没绑工具时，永远是空列表
+```
+
+## 第二块地基：`@tool` 定义工具
+
+### 函数即工具
+
+LangChain 的 `@tool` 装饰器把一个普通 Python 函数变成模型可调用的工具。它自动从**类型注解**生成参数 schema，从 **docstring** 生成工具描述。
+
+```python
+from langchain.tools import tool
+
+@tool
+def get_weather(city: str) -> str:
+    """获取指定城市的实时天气信息。
+
+    Args:
+        city: 城市名，例如 "北京"、"上海"
+    """
+    # 这里假装是真实查询（联网 / 数据库）
+    fake = {"北京": "晴，28°C", "上海": "多云，25°C"}
+    return fake.get(city, f"{city}: 暂无数据")
+```
+
+四个要点：
+
+1. **类型注解必需**——`city: str` 决定了模型传参的 schema
+2. **docstring 是工具描述**——模型靠这段文字判断「该不该调这个工具」
+3. **`Args:` 段会被解析**成每个参数的描述，喂给模型
+4. 装饰后 `get_weather` 不再是普通函数，而是一个 `BaseTool` 对象
+
+```python
+print(get_weather.name)                         # get_weather
+print(get_weather.args_schema.model_json_schema())
+# {'properties': {'city': {'type': 'string', ...}}, 'required': ['city'], ...}
+```
+
+> 你可以把 `@tool` 想象成给函数装了一个「标准接口」——模型不需要知道你的函数怎么实现，只需要这份 JSON schema 就知道怎么调用它。
+
+### 复杂参数用 Pydantic
+
+简单参数靠类型注解就够。但如果参数有约束、枚举、嵌套，用 `args_schema` 显式声明更可控：
+
+```python
+from pydantic import BaseModel, Field
+
+class WeatherInput(BaseModel):
+    """天气查询的输入。"""
+    city: str = Field(description="城市名，例如 北京")
+    units: str = Field(default="celsius", description="温度单位：celsius 或 fahrenheit")
+
+@tool(args_schema=WeatherInput)
+def get_weather(city: str, units: str = "celsius") -> str:
+    """获取指定城市的实时天气。"""
+    return f"{city}: 晴，28°{units[0].upper()}"
+```
+
+## 第三块地基：`bind_tools` 把工具交给模型
+
+光定义工具没用，模型不知道它存在。`bind_tools` 把工具列表绑定到模型上，返回一个**新的 Runnable**——它的 `.invoke()` 会返回带 `tool_calls` 的 `AIMessage`。
+
+```python
+# 把工具列表交给模型（注意是列表，即使只有一个工具）
+model_with_tools = model.bind_tools([get_weather])
+
+ai_msg = model_with_tools.invoke("北京今天天气怎么样？")
+
+print(ai_msg.text)               # 可能是空字符串，或一句"我需要查一下天气"
+print(ai_msg.tool_calls)
+# [{'name': 'get_weather', 'args': {'city': '北京'}, 'id': 'call_1'}]
+```
+
+`tool_calls` 的结构是关键，记住它：
+
+```python
+# ai_msg.tool_calls: list[dict]
+[
+    {"name": "get_weather", "args": {"city": "北京"}, "id": "call_1"},
+    # 同一轮可能调多个工具，每个都有独立的 id
+    # {"name": "get_weather", "args": {"city": "上海"}, "id": "call_2"},
+]
+```
+
+三个字段：
+
+- `name`：要调的工具名
+- `args`：模型生成的参数（已符合 schema）
+- `id`：这次调用的唯一标识，回填结果时要靠它对齐
+
+> 注意模型**只是说「我要调这个工具」**，并没有真的执行。真正执行工具的是你的代码——这是 Agent 和「让模型直接干活」的本质区别：模型决策，代码执行。
+
+## 把三块串起来：一次完整的 Tool Call 闭环
+
+这是本章的核心。一个完整的 tool call 分三步，缺一不可：
+
+1. **模型输出 `tool_calls`**——模型说「我要调 `get_weather(city='北京')`」
+2. **代码执行工具**——你拿到 `tool_calls`，执行对应函数，把结果包成 `ToolMessage` 塞回 messages
+3. **再 invoke 拿最终答案**——模型看到工具结果，生成有依据的回答
+
+<AgentDemoButton client:visible demoId="langchain-foundation" label="运行：无工具瞎答 vs bind_tools 正确调用" />
+
+上面的 Demo 对比了两种轨迹：左边是没绑定工具的模型直接瞎编，右边是 `bind_tools` 后的模型走完三步闭环给出有依据的答案。下面是完整的可运行代码：
+
+```python
+import os
+from dotenv import load_dotenv
+from langchain.chat_models import init_chat_model
+from langchain.tools import tool
+from langchain.messages import HumanMessage
+
+load_dotenv()
+
+# --- 1. 定义工具 ---
+@tool
+def get_weather(city: str) -> str:
+    """获取指定城市的实时天气信息。
+
+    Args:
+        city: 城市名，例如 "北京"
+    """
+    fake = {"北京": "晴，28°C", "上海": "多云，25°C"}
+    return fake.get(city, f"{city}: 暂无数据")
+
+# --- 2. 接模型并绑定工具 ---
+model = init_chat_model(
+    f"openai:{os.environ['MODEL_NAME']}",
+    base_url=os.environ["BASE_URL"],
+    api_key=os.environ["API_KEY"],
+    temperature=0,
+)
+model_with_tools = model.bind_tools([get_weather])
+
+# --- 3. 单轮 tool call 闭环 ---
+messages = [HumanMessage("北京和上海今天天气怎么样？")]
+
+# (a) 模型输出 tool_calls
+ai_msg = model_with_tools.invoke(messages)
+messages.append(ai_msg)                          # AIMessage（含 tool_calls）塞回 messages
+
+print("模型 tool_calls:", ai_msg.tool_calls)
+# [{'name': 'get_weather', 'args': {'city': '北京'}, 'id': 'call_1'},
+#  {'name': 'get_weather', 'args': {'city': '上海'}, 'id': 'call_2'}]
+
+# (b) 代码执行工具 → 构造 ToolMessage 塞回 messages
+for tc in ai_msg.tool_calls:
+    tool_msg = get_weather.invoke(tc)            # 接受整个 tool_call dict，返回 ToolMessage
+    messages.append(tool_msg)
+    print(f"执行 {tc['name']}({tc['args']}) → {tool_msg.content}")
+
+# (c) 再 invoke 拿最终答案
+final = model_with_tools.invoke(messages)
+print("最终答案:", final.text)
+# "北京今天晴 28°C，上海多云 25°C。"
+```
+
+### 三个容易踩的坑
+
+**坑 1：忘了把 `AIMessage` 塞回 messages**
+
+`ai_msg`（含 `tool_calls`）必须 append 进 `messages`，否则第 (c) 步模型看不到「自己刚说要调工具」，会重复请求或答非所问。
+
+**坑 2：`tool_call_id` 没对齐**
+
+`ToolMessage` 必须带上对应的 `tool_call_id`，告诉模型「这是对 `call_1` 那次调用的回复」。用 `get_weather.invoke(tc)` 会自动对齐，手动构造时容易漏：
+
+```python
+# 手动构造 ToolMessage（不推荐，容易漏 id）
+from langchain.messages import ToolMessage
+tool_msg = ToolMessage(
+    content="晴，28°C",
+    tool_call_id=tc["id"],   # ← 必须和 AIMessage.tool_calls[i]["id"] 对齐
+)
+```
+
+**坑 3：以为模型会自己执行工具**
+
+`bind_tools` 只是让模型**输出** `tool_calls`，不会真去执行。执行永远是你的代码的活。这是初学者最普遍的误解。
+
+## 这套闭环的局限：它只跑一轮
+
+注意上面的代码是**单轮**——模型调一次工具，拿到结果就给了最终答案。但真实任务往往需要多轮：
+
+- 查完天气，还要查机票
+- 查完机票，发现没直飞，要换城市再查
+- 每一轮都要「思考 → 调工具 → 观察 → 再思考」
+
+把上面的三步法套进一个 `while` 循环，就是第 1 章说的 ReAct 模式：
+
+```text
+while True:
+    ai_msg = model_with_tools.invoke(messages)
+    messages.append(ai_msg)
+    if not ai_msg.tool_calls:        # 模型不再调工具 → 给出最终答案
+        break
+    for tc in ai_msg.tool_calls:
+        messages.append(执行工具(tc))
+print(messages[-1].text)
+```
+
+看起来很简单，但真跑起来你会发现：上下文越积越长、某一步工具抛错怎么办、跑进死循环怎么办——这些「循环管不了的事」，正是第 3 章手搓 ReAct 要亲身体会的痛点。
+
+## 小结
+
+1. **三块地基 API**：`init_chat_model` 统一接模型、`@tool` 把函数变成工具、`bind_tools` 把工具交给模型。后面所有上层 Agent 方案都长在这套地基上。
+2. **`@tool` 靠类型注解 + docstring 自动生成 schema**——模型不需要看你的实现，靠 JSON schema 就知道怎么调。
+3. **`bind_tools` 只让模型「说」要调什么工具**，真正执行的是你的代码。`AIMessage.tool_calls` 就是模型「说出口」的工具调用请求。
+4. **一次完整 tool call 三步走**：模型输出 `tool_calls` → 代码执行工具并回填 `ToolMessage` → 再 invoke 拿最终答案。三步缺一不可，`tool_call_id` 必须对齐。
+5. **这套闭环只跑一轮**——多轮就是套进 `while` 循环，但循环本身管不了上下文膨胀、错误恢复、死循环，那是第 3 章的痛点现场。
+
+> 下一章，我们不靠任何 Agent 框架，自己把这个 `while` 循环手搓出来——亲身体会「上下文爆了」「某步抛错了」「死循环了」这些裸循环的痛，才能理解为什么需要 LangGraph。
