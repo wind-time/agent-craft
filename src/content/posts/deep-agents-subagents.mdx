@@ -1,0 +1,225 @@
+---
+title: "第 7 章 · 任务规划与子 Agent 编排：write_todos 与 Context Quarantine"
+pubDatetime: 2026-07-12T00:00:00Z
+chapter: 7
+featured: false
+draft: false
+tags: [agent, deepagents, subagent]
+description: "第 6 章讲了 Deep Agents 的虚拟文件系统。本章深入它的另两项能力：用 write_todos 自动拆解复杂任务，用子 Agent 把子任务委派出去并隔离上下文。主 Agent 只看结果不看过程，调度再多子任务上下文也不膨胀。"
+---
+
+import AgentDemoButton from "@/components/_interactive/AgentDemoButton.tsx";
+
+> 第 6 章讲了 Deep Agents 的虚拟文件系统——把资料外置到文件。本章深入另两项能力：用 `write_todos` 自动拆解复杂任务，用子 Agent 把子任务委派出去。这是第 6 章三套上下文机制里的第三套——Context Quarantine（上下文隔离）。
+
+## 单 Agent 的瓶颈：什么都自己干
+
+想象一个复杂任务：「调研三个框架的子 Agent 机制，写对比报告」。如果单个 Agent 一把梭，它得自己查三次资料、自己汇总。每查一次，几百 token 的原始资料就堆进主上下文，三轮下来主上下文几千 token，写报告时还得全读一遍。
+
+问题本质：**子任务的中间过程（一堆 search 结果）和最终结论（一段摘要）混在同一个上下文里**。你真正需要的只是最终结论，但中间过程占满了工作台。
+
+Deep Agents 的解法是**子 Agent**：把每个子任务委派给一个独立的子 Agent，子 Agent 在自己隔离的上下文里跑完整个调研，**只把最终摘要回传给主 Agent**。主 Agent 的工作台始终干净。
+
+## 任务规划：`write_todos` 自动拆解
+
+复杂任务一开始，Agent 得先想清楚「分几步、先做哪个」。Deep Agents 默认挂了 `TodoListMiddleware`（来自 `langchain.agents.middleware`），自动注入一个 `write_todos` 工具。
+
+### `write_todos` 工具签名
+
+```python
+# 每个 todo 只有两个字段
+class Todo(TypedDict):
+    content: str                              # 任务描述
+    status: Literal["pending", "in_progress", "completed"]  # 三态
+
+# 工具入参就是 todo 列表
+def write_todos(todos: list[Todo]) -> ...: ...
+```
+
+注意两点（容易写错）：
+- 每个 todo **只有 `content` 和 `status`**，没有 `priority` 之类的字段
+- `status` 是三值枚举：`pending`（待办）/ `in_progress`（进行中）/ `completed`（已完成）
+
+### todo 存在 state 里，不进 prompt
+
+`todos` 存在 graph state 的独立字段里（用 `OmitFromInput` 标注，从模型 input 里排除）——意思是历史 todo 列表**不会塞进 system prompt**，只作为状态跨轮次保留。配合 checkpointer + 同一个 `thread_id`，todos 跨 invoke 也持久。
+
+`write_todos` 是「整体替换」语义：每次调用覆盖整个列表。每轮 model turn 最多调一次，并行调多个会被中间件拦截报错。
+
+### Agent 自动规划
+
+`TodoListMiddleware` 会在 `wrap_model_call` 里动态注入一段 system prompt，引导模型在遇到复杂目标时主动 `write_todos` 拆解、完成一项就更新 `status`。你不用手动写提示词引导：
+
+```python
+from deepagents import create_deep_agent
+from langgraph.checkpoint.memory import InMemorySaver
+
+agent = create_deep_agent(
+    model="openai:your-model-name",
+    checkpointer=InMemorySaver(),           # todos 跨轮次持久
+)
+
+result = agent.invoke(
+    {"messages": [{"role": "user", "content": "对比 LangGraph / Deep Agents / MCP 三家子 Agent 机制，写报告"}]},
+    config={"configurable": {"thread_id": "compare-1"}},
+)
+# 模型会自主执行：
+# 1. write_todos(todos=[{content:"调研 LangGraph",status:"in_progress"}, ...])
+# 2. 逐项执行（可能委派子 Agent），每完成一项再 write_todos 更新 status
+# 3. 全部 completed 后写最终报告
+```
+
+> `write_todos` 不保证任务质量提升，它本质是给模型一个「外部记忆」——把计划写下来，避免跑着跑着忘了要干啥。对长任务（十几步以上）尤其有用，短任务模型自己记着就行，不必强求规划。
+
+## 子 Agent：委派 + 上下文隔离
+
+这是本章的核心。`create_deep_agent` 的 `subagents=` 参数声明子 Agent，主 Agent 通过自动注入的 `task` 工具委派任务。
+
+### 声明子 Agent
+
+子 Agent 有三种声明方式，最常用的是 `SubAgent`（TypedDict，可当 dict 传）：
+
+```python
+from deepagents import create_deep_agent, SubAgent
+
+research_subagent = SubAgent(
+    name="research-agent",                              # 必填
+    description="用于深入研究型问题，擅长查资料并总结",     # 必填，主 Agent 据此决定何时委派
+    system_prompt="你是一个优秀的研究员，回答要简洁。",     # 必填，不继承主 Agent
+    tools=[internet_search],                            # 可选，默认继承主 Agent tools
+    model="openai:your-model-name",                     # 可选，默认继承主 Agent model
+)
+
+agent = create_deep_agent(
+    model="openai:your-model-name",
+    subagents=[research_subagent],
+)
+```
+
+字段继承规则要记清（容易踩坑）：
+
+| 字段 | 是否继承主 Agent |
+|---|---|
+| `system_prompt` | ❌ 必填，自己给 |
+| `tools` | ✅ 默认继承；显式给则整体覆盖 |
+| `model` | ✅ 默认继承；可覆盖 |
+| `middleware` | ❌ 不继承，合并进子 Agent 默认栈 |
+| `skills` | ❌ 不继承（仅 `general-purpose` 例外） |
+
+### `task` 工具：主 Agent 怎么委派
+
+只要有一个同步子 Agent，`SubAgentMiddleware` 就自动注入 `task` 工具。**注意签名容易写错**——入参是 `description` 和 `subagent_type`，不是 `name` 和 `task`：
+
+```python
+# task 工具的实际签名
+def task(description: str, subagent_type: str) -> str | Command:
+    """description: 子任务详细描述
+       subagent_type: 子 Agent 名（必须是 subagents 里声明过的 name）"""
+```
+
+主 Agent 决定委派时，会这样调用：
+
+```python
+task(description="调研 LangGraph 的子 Agent 机制并总结", subagent_type="research-agent")
+```
+
+主 Agent 一次 turn 可以并发发多个 `task` 调用，把三个主题的调研同时甩出去。
+
+### Context Quarantine：只回传结果，不回传过程
+
+这是子 Agent 最值钱的机制。子 Agent 执行时的所有中间消息（几十次 tool calls、几轮思考）**全隔离在子 Agent 自己的上下文里，不进主 Agent**。主 Agent 只收到一条 `ToolMessage`：
+
+- 没配 `response_format`：子 Agent 最后一条消息的文本原样回传
+- 配了 `response_format`：子 Agent 的结构化响应 JSON 序列化后回传
+
+<AgentDemoButton client:visible demoId="deep-agents-subagents" label="运行：单 Agent 一把梭 vs 主 Agent 调度子 Agent" />
+
+上面的 Demo 对比了两种方式执行同一个「调研三框架写报告」任务：
+
+- **左边单 Agent**：三个主题的 search 结果（共 2000+ token）全堆进主上下文，写报告时要全读一遍，后续追问也背着这几千 token
+- **右边主 Agent + 子 Agent**：每个主题委派给研究子 Agent，子 Agent 内部跑了 3 轮 search（2000+ token 中间消息）全被隔离，主 Agent 只收到三条 200 token 的摘要。**主上下文始终低水位**
+
+```python
+from deepagents import create_deep_agent, SubAgent
+from langgraph.checkpoint.memory import InMemorySaver
+
+def internet_search(query: str) -> str:
+    """搜索网络内容。"""
+    return f"关于 {query} 的搜索结果……"
+
+research_subagent = SubAgent(
+    name="research-agent",
+    description="用于深入研究型问题，擅长查资料并总结",
+    system_prompt="你是一个优秀的研究员，调研后输出简洁摘要。",
+    tools=[internet_search],
+)
+
+agent = create_deep_agent(
+    model="openai:your-model-name",
+    subagents=[research_subagent],
+    checkpointer=InMemorySaver(),
+)
+
+result = agent.invoke(
+    {"messages": [{"role": "user", "content": "对比 LangGraph / Deep Agents / MCP 三家子 Agent 机制，写报告"}]},
+    config={"configurable": {"thread_id": "compare-1"}},
+)
+# 主 Agent 会自主：
+# 1. write_todos 拆成三项
+# 2. task(description="调研 LangGraph...", subagent_type="research-agent") 委派
+#    → 子 Agent 内部跑 3 轮 search（隔离），回传 200 token 摘要
+# 3. task 调 Deep Agents、MCP（可并发）
+# 4. 基于三份摘要写报告
+```
+
+> 你可以把子 Agent 想象成「外包」——主 Agent 是项目经理，把调研活外包给三个研究员，每个研究员在自己工位上查一堆资料（隔离），最后只交一份摘要报告给项目经理。项目经理的桌子不会被三个研究员的草稿纸堆满。
+
+## 默认的 `general-purpose` 子 Agent
+
+如果你传了同步子 Agent，Deep Agents 默认还会自动加一个 `general-purpose` 子 Agent——用主 Agent 的 tools 和 model、自己的默认 system_prompt，处理那些不属于任何专用子 Agent 的杂活。你不用声明它就有。
+
+想完全禁用得同时满足：harness profile 设 `general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False)` + `subagents=` 不传任何同步子 Agent。日常用不到这层，默认行为就够。
+
+> ⚠️ 不要用 `excluded_middleware` 移除 `SubAgentMiddleware`——它是必需脚手架，移除会抛 `ValueError`。
+
+## 进阶：RubricMiddleware 自评迭代
+
+本章再补一个进阶能力——**自评迭代**。`RubricMiddleware` 让 Agent 跑完后，由一个独立的 grader 模型按你给的 rubric（评分标准）打分，不达标就回灌反馈让 Agent 再跑一轮：
+
+```python
+from deepagents import RubricMiddleware, create_deep_agent
+from langgraph.checkpoint.memory import InMemorySaver
+
+rubric_mw = RubricMiddleware(
+    model="openai:your-cheap-model",       # grader 用便宜模型
+    max_iterations=3,                      # 最多迭代 3 轮
+)
+
+agent = create_deep_agent(
+    model="openai:your-model-name",
+    middleware=[rubric_mw],
+    checkpointer=InMemorySaver(),
+)
+
+result = agent.invoke({
+    "messages": [{"role": "user", "content": "写一首关于春天的俳句"}],
+    "rubric": (                              # 评分标准，换行分隔的 checklist
+        "- 全诗三行\n"
+        "- 符合 5-7-5 音节\n"
+        "- 主题是春天"
+    ),
+})
+# Agent 写完 → grader 按 rubric 打分 → 不达标则回灌「哪条没满足、差在哪」→ Agent 重写
+```
+
+`RubricMiddleware` 需要 `deepagents>=0.6.5`，标记为 Beta。适合「有明确验收标准、但要反复打磨」的任务（写代码过测试、写文案达规范）。
+
+## 小结
+
+1. **`write_todos` 自动拆解复杂任务**：`TodoListMiddleware` 默认挂载，注入 `write_todos` 工具。每个 todo 只有 `content` + `status`（pending/in_progress/completed），存在 state 里不进 prompt，跨轮次持久。整体替换语义，每轮最多调一次。
+2. **子 Agent 声明式注册**：`subagents=[SubAgent(...)]`，主 Agent 自动获得 `task` 工具。`task` 签名是 `(description, subagent_type)`——不是 `(name, task)`，别写错。
+3. **Context Quarantine 是核心价值**：子 Agent 中间几十次 tool calls 全隔离，主 Agent 只收到一条最终摘要的 `ToolMessage`。主上下文不随子任务数膨胀——调度再多子任务，主 Agent 工作台始终干净。
+4. **字段继承规则**：`system_prompt` / `middleware` / `skills` 不继承主 Agent；`tools` / `model` / `permissions` 默认继承。默认还有个 `general-purpose` 子 Agent 处理杂活。
+5. **RubricMiddleware 自评迭代**：grader 模型按 rubric 打分，不达标回灌反馈再跑，适合有明确验收标准的打磨型任务（需 `deepagents>=0.6.5`）。
+
+> 至此 Deep Agents 的「执行体」能力讲完——文件系统、子 Agent、任务规划、自评迭代。下一章讲最后两块拼图：**长期记忆**（跨会话沉淀，从 InMemoryStore 到 PostgresStore）与 **Skills 能力包**（可复用能力，Progressive Disclosure 按需加载）。让 Agent 不只是「跑完就忘」，而是越用越聪明。
