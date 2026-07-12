@@ -1,0 +1,230 @@
+---
+title: "第 8 章 · 长期记忆与 Skills 能力包：让 Agent 越用越聪明"
+pubDatetime: 2026-07-12T00:00:00Z
+chapter: 8
+featured: false
+draft: false
+tags: [agent, deepagents, memory, skills]
+description: "前 7 章的 Agent 都有个通病：跑完就忘。本章上 Deep Agents 的最后两块拼图——长期记忆让 Agent 跨会话记住用户偏好，Skills 能力包让 Agent 按需加载可复用能力。两者互补，Agent 越用越聪明。"
+---
+
+import AgentDemoButton from "@/components/_interactive/AgentDemoButton.tsx";
+
+> 前 7 章的 Agent 都有个通病：跑完就忘。第 4 章的 checkpointer 只管单次会话内的状态，会话一结束，用户上次说的「我喜欢 TypeScript」就丢了，下次还得重说。本章上 Deep Agents 的最后两块拼图：长期记忆 + Skills 能力包。
+
+## 跑完就忘：前 7 章 Agent 的通病
+
+先厘清一个容易混的概念——**checkpointer vs store**，它俩都是「存东西」，但作用域不同：
+
+| | checkpointer | store |
+|---|---|---|
+| 作用域 | 单次会话（thread 内） | 跨会话（跨 thread） |
+| 存什么 | Agent 执行的完整状态快照 | 键值对（记忆、向量等） |
+| 导入 | `InMemorySaver`（`langgraph.checkpoint.memory`） | `InMemoryStore`（`langgraph.store.memory`） |
+| 第几章讲 | 第 4 章 | 本章 |
+| 传给 | `checkpointer=` | `store=` |
+
+第 4 章的 checkpointer 让你能「中断恢复」「时间旅行」，但那都在**同一个 thread 内**。用户关掉浏览器明天再来（新 thread），昨天的对话状态就没了。**跨会话**记住东西，要靠 store。
+
+> 注意这俩导入路径极易搞混：`InMemorySaver` 和 `InMemoryStore` 名字像、都在 `langgraph` 包里，但一个在 `langgraph.checkpoint.memory`，一个在 `langgraph.store.memory`，作用完全不同。第 4 章讲 `checkpointer=`，本章讲 `store=`。
+
+## 长期记忆：跨会话记住偏好
+
+Deep Agents 的记忆机制很巧妙——**记忆就是虚拟文件系统里某个目录下的 markdown 文件**，Agent 用第 6 章学的 `edit_file` 工具直接改。是否跨会话，取决于文件存在哪个 backend。
+
+### `memory=` 参数
+
+`memory=` 接受一个 AGENTS.md 文件路径列表（遵循 [agents.md](https://agents.md/) 规范）。传了它，Deep Agents 自动挂上 `MemoryMiddleware`：
+
+```python
+from deepagents import create_deep_agent
+
+agent = create_deep_agent(
+    model="openai:your-model-name",
+    memory=["/memories/AGENTS.md"],   # 启动时从这个路径加载记忆文件
+)
+```
+
+记忆的工作流程：
+
+1. **启动时全量加载**：`MemoryMiddleware.before_agent` 从 backend 下载 `/memories/AGENTS.md`，把内容塞进 system prompt 的 `<agent_memory>` 块。每次对话开始，记忆自动生效。
+2. **需要更新时，Agent 用 `edit_file` 改记忆文件**——没有专门的 memory 工具，就是用第 6 章的 `edit_file`。`MemoryMiddleware` 注入的 system prompt 会引导 Agent「用户给偏好时，及时 `edit_file` 更新记忆」。
+
+> 记忆没有专门工具，复用 `edit_file`——这是 Deep Agents 设计的优雅之处：文件系统是唯一的外置存储，记忆只是「约定好放在 `/memories/` 目录下的特殊文件」。
+
+### 跨会话持久化：StoreBackend
+
+记忆能不能跨会话，取决于 backend。第 6 章讲过四种 backend，其中 `StateBackend`（默认）只存 thread state，会话结束就丢。要跨会话，得用 `StoreBackend`（基于 LangGraph Store）或 `CompositeBackend`（按路径路由）：
+
+```python
+from deepagents import create_deep_agent
+from deepagents.backends import CompositeBackend, StateBackend, StoreBackend
+from deepagents.backends.utils import create_file_data
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.store.memory import InMemoryStore
+
+checkpointer = InMemorySaver()        # 短期：thread 内状态
+store = InMemoryStore()               # 长期：跨 thread 记忆
+
+# /memories/ 路径走 StoreBackend（跨会话持久），其他走 StateBackend（临时）
+backend = CompositeBackend(
+    default=StateBackend(),
+    routes={
+        "/memories/": StoreBackend(
+            namespace=lambda rt: (rt.server_info.user.identity,),  # 按用户隔离
+        ),
+    },
+)
+
+agent = create_deep_agent(
+    model="openai:your-model-name",
+    backend=backend,
+    memory=["/memories/AGENTS.md"],
+    checkpointer=checkpointer,
+    store=store,
+)
+```
+
+`namespace` 决定记忆的作用域——按用户隔离 `(user.identity,)`、按 agent 共享 `(assistant_id,)`、组织内共享 `(org_id,)`，灵活组合。
+
+> 生产环境把 `InMemoryStore` 换成 `PostgresStore`（`from langgraph.store.postgres import PostgresStore`）即可，其余代码不动。memory 文件存进 Postgres，真正跨会话、跨重启持久。
+
+### 完整示例：记住用户偏好
+
+```python
+from deepagents import create_deep_agent
+from deepagents.backends import CompositeBackend, StateBackend, StoreBackend
+from deepagents.backends.utils import create_file_data
+from langgraph.store.memory import InMemoryStore
+
+backend = CompositeBackend(
+    default=StateBackend(),
+    routes={"/memories/": StoreBackend(namespace=lambda rt: (rt.server_info.user.identity,))},
+)
+
+agent = create_deep_agent(
+    model="openai:your-model-name",
+    backend=backend,
+    memory=["/memories/AGENTS.md"],
+    system_prompt="当用户告知偏好时，用 edit_file 写到 /memories/AGENTS.md 里。",
+    store=InMemoryStore(),
+)
+
+# 会话 1：seed 空记忆 + 让 agent 记下偏好
+agent.invoke(
+    {
+        "messages": [{"role": "user", "content": "我喜欢 TypeScript，回复尽量简短。"}],
+        "files": {"/memories/AGENTS.md": create_file_data("# 用户偏好\n\n(待补充)\n")},
+    },
+    config={"configurable": {"thread_id": "session-1"}},
+)
+
+# 会话 2（新 thread）：agent 启动时从 store 读 AGENTS.md，偏好自动进 system prompt
+agent.invoke(
+    {"messages": [{"role": "user", "content": "给我写个 hello world"}]},
+    config={"configurable": {"thread_id": "session-2"}},
+)
+# Agent 自动用 TypeScript、简短回答：console.log('Hello, World')
+```
+
+## Skills 能力包：可复用能力，按需加载
+
+记忆解决「记住事实/偏好」，Skills 解决「复用操作能力」——比如「查 LangGraph 文档」「按公司规范写 PR」「生成测试用例」这类可复用的工作流。
+
+### SKILL.md 结构
+
+一个 skill 是一个目录，里面放 `SKILL.md`（指令）+ 可选的 `scripts/` / `references/` / `assets/`（资源）：
+
+```text
+skills/
+  langgraph-docs/           ← 目录名必须等于 frontmatter 的 name 字段
+    SKILL.md                 ← 必需：YAML frontmatter + markdown 指令
+    scripts/                 ← 可选：可执行脚本
+      fetch_docs.py
+    references/              ← 可选：参考文档
+      api-patterns.md
+```
+
+`SKILL.md` 的 frontmatter：
+
+```markdown
+---
+name: langgraph-docs                        # 必填，必须等于父目录名
+description: 查询 LangGraph 文档时用此 skill，获取准确、最新的指引。  # 必填
+license: MIT                                # 可选
+---
+
+# langgraph-docs
+
+## Instructions
+1. 用 fetch_url 读 https://docs.langchain.com/llms.txt
+2. 根据问题选 2-4 个最相关文档 URL
+3. 逐个 fetch 并综合，先给直接答案再附链接
+```
+
+### Progressive Disclosure：三层按需加载
+
+这是 Skills 的精髓——**不是启动时全装进来，而是分三层按需加载**，避免上下文被一堆 skill 指令塞满：
+
+| 层级 | 加载什么 | 何时加载 | 谁管 |
+|---|---|---|---|
+| **L1 元数据** | 每个 skill 的 `name` + `description` | agent 启动时，扫描所有 SKILL.md frontmatter，注入 system prompt 的「Available Skills」列表 | `SkillsMiddleware` |
+| **L2 指令** | 完整 SKILL.md 正文 | skill 被激活时，Agent 主动 `read_file` 读全文 | `SkillsMiddleware` 引导 LLM 这么做 |
+| **L3 资源** | `scripts/` / `references/` 下的文件 | 仅当 SKILL.md 指令明确要求时 | LLM 自身行为 |
+
+启动时只装 L1（每个 skill 一行 name + description），上下文几乎不占。用到某 skill 才 `read_file` 读 L2 指令，指令要资源才加载 L3。**10 个 skill 启动只占 10 行元数据**，而不是 10 份完整指令。
+
+### 用法
+
+```python
+from deepagents import create_deep_agent
+from deepagents.backends import FilesystemBackend
+
+backend = FilesystemBackend(root_dir="./my-project")  # skills 目录在这下面
+
+agent = create_deep_agent(
+    model="openai:your-model-name",
+    backend=backend,
+    skills=["/skills/"],                  # 扫描这个目录下所有 skill
+)
+
+result = agent.invoke(
+    {"messages": [{"role": "user", "content": "怎么用 LangGraph 建状态图？"}]},
+    config={"configurable": {"thread_id": "1"}},
+)
+# Agent 内部：
+# 1. 启动时已加载 langgraph-docs skill 的元数据（L1）
+# 2. 识别问题匹配该 skill → read_file("/skills/langgraph-docs/SKILL.md", limit=1000)（L2）
+# 3. 按 SKILL.md 指令 fetch 文档、综合回答（L3 按需）
+```
+
+## 记忆 vs Skills：边界
+
+两者都「存东西跨会话用」，但定位不同：
+
+| | 记忆（Memory） | Skills |
+|---|---|---|
+| 本质 | 跨会话的**事实/偏好**（代码风格、用户偏好、项目约定） | 可复用的**操作能力/指令工作流** |
+| 加载时机 | **启动时全量加载**进 system prompt | **按需加载**（Progressive Disclosure） |
+| 文件格式 | `AGENTS.md`（纯 markdown） | `SKILL.md`（YAML frontmatter + markdown） |
+| 谁更新 | Agent 用 `edit_file` 主动更新 | 通常静态定义，Agent 一般不改 |
+| 占上下文 | 启动就占（但通常不长） | 启动只占元数据，用到才占 |
+
+一句话：**记忆是「永远装着的事实」，Skills 是「用到才装的技能」**。两者能一起用——`memory=[...]` + `skills=[...]` 同时传，互不干扰。
+
+<AgentDemoButton client:visible demoId="deep-agents-memory-skills" label="运行：无记忆每次从头 vs 记忆+Skills 越用越聪明" />
+
+上面的 Demo 对比了两种 Agent 跨两次会话的表现：
+
+- **左边无记忆 Agent**：会话 1 用户说偏好，Agent 答了但没存；会话 2 用户问 hello world，Agent 默认用 Python 还写一大段——偏好没记住，能力靠 system_prompt 写死
+- **右边有记忆 + Skills**：会话 1 用 `edit_file` 把偏好写进 `/memories/AGENTS.md`（存到 StoreBackend）；会话 2 启动自动加载偏好 + 识别到 LangGraph 问题后 `read_file` 加载 skill 指令。**偏好自动生效、能力按需加载**
+
+## 小结
+
+1. **checkpointer vs store**：checkpointer（`InMemorySaver`）管单次会话内状态，第 4 章讲过；store（`InMemoryStore` / `PostgresStore`）管跨会话持久，本章讲。导入路径 `langgraph.checkpoint.memory` vs `langgraph.store.memory`，别搞混。
+2. **长期记忆 = memory= + StoreBackend**：记忆就是虚拟文件系统里 `/memories/` 下的 markdown 文件，Agent 用 `edit_file` 改。`MemoryMiddleware` 启动时全量加载进 system prompt。跨会话靠 `StoreBackend` + `store=`（生产换 `PostgresStore`）。
+3. **Skills = skills= + SkillsMiddleware**：一个 skill 是一个目录（`SKILL.md` + 可选资源）。`name` 必须等于目录名，`description` 决定何时激活。
+4. **Progressive Disclosure 三层**：L1 启动装元数据（name+description）→ L2 用到才 `read_file` 读指令 → L3 指令要才装资源。10 个 skill 启动只占 10 行，不塞满上下文。
+5. **记忆 vs Skills 互补**：记忆是「永远装着的事实/偏好」，Skills 是「用到才装的技能」。两者可同用，Agent 从「跑完就忘」变成「越用越聪明」。
+
+> 至此 Deep Agents 篇收尾。你能用文件系统管理资料、用子 Agent 隔离上下文、用记忆跨会话沉淀、用 Skills 复用能力——一个生产级 Harness 该有的都有了。下一章拉到生态视野，横向对比 CrewAI / AG2（原 AutoGen）/ OpenAI Agents SDK 等主流框架，知道何时该用 Deep Agents、何时该选别的。
