@@ -33,9 +33,9 @@ print(response.content)
 
 ## 裸 LLM 调用 vs. 带工具循环：一张图看清差距
 
-<AgentDemoButton demoId="llm-vs-agent" label="运行：裸 LLM vs. Agent 循环" />
+<AgentDemoButton client:visible demoId="llm-vs-agent" label="运行：裸 LLM vs. Agent 循环" />
 
-上面的交互式 Demo（目前为骨架占位，正式 trace 待后端运行时接入）对比了两种执行轨迹：
+点击上面的按钮，会在同一页面里并排回放两条执行轨迹——左边是裸 LLM 调用，右边是带工具循环的 Agent。下表把它们沿五个维度对齐：
 
 | 维度 | 裸 LLM 调用 | 带工具循环的 Agent |
 |---|---|---|
@@ -125,7 +125,7 @@ while True:
 2. **第 3 章手搓 ReAct 循环**——不靠任何 Agent 框架，自己写 while，亲身体会上面三个痛点。
 3. **第 4-5 章上 LangGraph**——用 StateGraph 解决循环与状态问题，见识 Runtime 层。
 4. **第 6-8 章上 Deep Agents**——见识 Harness 层如何把上下文工程、子 Agent、记忆打包好。
-5. **第 9 章横评生态**——CrewAI / OpenAI Agents SDK / AG2 等都拉出来比一比。
+5. **第 9 章横评生态**——CrewAI / OpenAI Agents SDK / AG2（原 AutoGen）等都拉出来比一比。
 6. **第 10 章上线实战**——把 Agent 部署到生产，配真实可运行的交互式 Demo。
 
 每一章解决上一章留下的痛点，又埋下下一章的钩子。你顺着读，会发现"为什么需要这一层"是自然涌现的，而不是强行记忆。

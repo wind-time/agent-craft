@@ -17,8 +17,6 @@
 
 不只是纯文字。关键篇章会嵌入 **可真实运行的 Agent Demo**，读者在文章里直接点按钮就能看到 Agent 的执行轨迹（tool calls、中间思考、最终输出）。
 
-> 运行时方案见 [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md)。
-
 ## 本地开发
 
 环境要求：**Node.js ≥ 22.12.0**
@@ -52,7 +50,6 @@ agent-craft/
 │   ├── pages/             # 路由
 │   ├── styles/            # 全局样式与主题色
 │   └── i18n/lang/zh.ts    # 中文 UI 文案
-├── docs/ARCHITECTURE.md   # 架构与骨架设计文档（必读）
 ├── astro-paper.config.ts  # 站点元数据
 └── astro.config.ts        # Astro 主配置
 ```
@@ -61,7 +58,6 @@ agent-craft/
 
 - 普通文章：在 `src/content/posts/` 下新建 `.md`
 - 交互式文章：用 `.mdx`，import `AgentDemoButton` 组件
-- 详见 [CLAUDE.md](./CLAUDE.md) 与 [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md)
 
 ## 协议
 

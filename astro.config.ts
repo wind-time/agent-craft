@@ -21,6 +21,7 @@ import config from "./astro-paper.config";
 
 export default defineConfig({
   site: config.site.url,
+  base: "/agent-craft/", // 仓库名，部署到 用户名.github.io/agent-craft/ 子路径必需
   integrations: [
     mdx(),
     react(),

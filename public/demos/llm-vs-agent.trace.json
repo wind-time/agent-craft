@@ -1,0 +1,43 @@
+{
+  "demoId": "llm-vs-agent",
+  "variants": [
+    {
+      "id": "baseline",
+      "label": "裸 LLM 调用（无工具）",
+      "steps": [
+        {
+          "type": "thought",
+          "content": "用户问：「北京今天天气怎么样？」我没有工具，直接凭参数生成一段像答案的文字。"
+        },
+        {
+          "type": "output",
+          "content": "北京今天晴，气温约 25°C。",
+          "note": "无任何数据依据，模型概率生成——可能完全错误。"
+        }
+      ]
+    },
+    {
+      "id": "agent",
+      "label": "带工具循环的 Agent",
+      "steps": [
+        {
+          "type": "thought",
+          "content": "我无法知道实时天气，需要调用工具查询北京当前天气。"
+        },
+        {
+          "type": "tool_call",
+          "toolName": "get_weather",
+          "content": "get_weather(city=\"北京\")"
+        },
+        {
+          "type": "thought",
+          "content": "工具返回：晴，气温 28°C。现在可以给出有依据的回答了。"
+        },
+        {
+          "type": "output",
+          "content": "北京今天晴，气温 28°C。"
+        }
+      ]
+    }
+  ]
+}
