@@ -1,0 +1,241 @@
+---
+title: "create_agent 与复杂编排：一键封装、人机协作审批与流式输出"
+pubDatetime: 2026-07-12T00:00:00Z
+chapter: 5
+featured: false
+draft: false
+tags: [agent, langchain, langgraph]
+description: "上一章手写 StateGraph 跑通了 ReAct，但 30 多行样板代码大部分是图组装。本章用 create_agent 一行创建 Agent，再用 Middleware 系统加人机协作审批、token 级流式输出——开箱即用与复杂编排如何并存。"
+---
+
+import AgentDemoButton from "@/components/_interactive/AgentDemoButton.tsx";
+
+> 上一章我们用 StateGraph 手写了 ReAct，跑是跑通了，但 30 多行里业务逻辑只占 5 行，其余全是 State 定义、节点函数、路由、连边这些样板。每写一个 Agent 都重复一遍，谁都烦。本章用 `create_agent` 一行创建 Agent，再讲它带来的进阶能力——人机协作审批和 token 级流式。
+
+## 从「手写图」到「一键封装」
+
+第 4 章的手写 StateGraph，核心就这么几件事：定义 State、写 agent 节点（调模型）、写 tools 节点（执行工具）、写路由函数（看 `tool_calls` 决定去 tools 还是 END）、连边、compile。**每一个 ReAct Agent 都是这套**——LangGraph 把它预组装成了 `create_agent`：
+
+```python
+from langchain.agents import create_agent
+
+agent = create_agent(
+    model=model,                                    # 接好的模型
+    tools=[get_weather, subtract],                  # 工具列表
+    system_prompt="你是一个会查资料的助手，回答要简洁。",  # 系统提示词
+)
+```
+
+一行创建。内部干的事和第 4 章手写的一模一样——建图、加 model 节点、加 tools 节点、连条件边、compile。返回的是一个 `CompiledStateGraph` 对象。
+
+> **迁移提醒**：旧代码里的 `from langgraph.prebuilt import create_react_agent` 已在 LangGraph 1.0 废弃（2.0 删除），统一用 `from langchain.agents import create_agent`。两个关键差异：`prompt=` 参数改名 `system_prompt=`（只接字符串）；`pre_model_hook` / `post_model_hook` 砍掉了，换成 `middleware=[...]`。
+
+### 它就是 StateGraph，第 4 章学的都能用
+
+`create_agent` 返回的对象 `isinstance(agent, CompiledStateGraph)` 为真——它就是编译后的 LangGraph。所以第 4 章学的那些全都能用：
+
+```python
+# 带 checkpointer 实现记忆 + 中断恢复
+from langgraph.checkpoint.memory import InMemorySaver
+
+agent = create_agent(
+    model=model,
+    tools=[get_weather, subtract],
+    checkpointer=InMemorySaver(),              # ← 传 checkpointer
+)
+
+config = {"configurable": {"thread_id": "thread-1"}}
+result = agent.invoke(
+    {"messages": [HumanMessage("北京和上海今天温差多少度？")]},
+    config,                                     # ← 传 config
+)
+print(result["messages"][-1].text)
+
+# 时间旅行照样能用
+for snapshot in agent.get_state_history(config):
+    print(snapshot.next, snapshot.metadata.get("source"))
+```
+
+`get_state_history`、`update_state`、`get_state`、作为子图嵌进更大的 `StateGraph`——全部可用。`create_agent` 不是另起炉灶，是 StateGraph 的「预组装便捷层」。
+
+## 调用约定
+
+输入永远是 `{"messages": [...]}`，消息可以是 dict 也可以是 `BaseMessage` 对象：
+
+```python
+result = agent.invoke(
+    {"messages": [{"role": "user", "content": "北京天气怎么样？"}]},
+    config={"configurable": {"thread_id": "demo-1"}},
+)
+
+# 返回值是 state 字典，取最后一条消息就是答案
+final_msg = result["messages"][-1]
+print(final_msg.content)
+```
+
+`thread_id` 用来绑 checkpointer 的会话历史——同一个 id 再 invoke，会累积之前的对话。
+
+## Middleware：把横切逻辑从业务里抽出去
+
+这是 `create_agent` 最值钱的新特性。第 3 章我们给手搓 ReAct 打补丁——循环检测、异常重试、参数校验——全塞在 `run_react` 函数里，臃肿难维护。Middleware 把这些**横切关注点**抽成可插拔的中间件，业务循环保持干净。
+
+### 内置 Middleware 速查
+
+LangChain 1.3.x 自带一批现成中间件，从 `langchain.agents.middleware` 导入：
+
+| Middleware | 作用 |
+|---|---|
+| `HumanInTheLoopMiddleware` | 工具调用前暂停等审批（本章重点） |
+| `ToolRetryMiddleware` | 工具失败指数退避重试 |
+| `ModelRetryMiddleware` | 模型 API 失败重试（1.3.x 新增） |
+| `ModelFallbackMiddleware` | 主模型失败按序回退到备选 |
+| `SummarizationMiddleware` | 超阈值自动把旧消息压成摘要（解决上下文膨胀） |
+| `ToolCallLimitMiddleware` | 限制工具调用次数（防死循环） |
+| `ModelCallLimitMiddleware` | 限制模型调用次数 |
+| `TodoListMiddleware` | 自动加 `write_todos` 工具做任务规划 |
+
+> 留意这些名字——`SummarizationMiddleware` 解决第 3 章的「上下文膨胀」痛点，`ToolCallLimitMiddleware` / `ToolRetryMiddleware` 解决「模型不听话」，第 6 章的 Deep Agents 会把更多能力（子 Agent、记忆、Skills）也做成 Middleware。这是个可组合的能力市场。
+
+## 人机协作审批（HITL）
+
+Agent 调工具时，有些动作有风险——删数据库、发邮件、写文件到生产路径——你不想让模型全自动执行，要人工先看一眼。这就是 **HITL（Human In The Loop）**。
+
+### 用 `HumanInTheLoopMiddleware`（推荐）
+
+最省事的方式：给 `create_agent` 加一个 `HumanInTheLoopMiddleware`，指定哪些工具要审批：
+
+```python
+from langchain.agents import create_agent
+from langchain.agents.middleware import HumanInTheLoopMiddleware
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command
+
+@tool
+def write_file(path: str, content: str) -> str:
+    """把内容写入指定路径。"""
+    # 真实实现：open(path, "w").write(content)
+    return f"已写入 {len(content)} 字符到 {path}"
+
+agent = create_agent(
+    model=model,
+    tools=[write_file],
+    middleware=[
+        HumanInTheLoopMiddleware(interrupt_on={"write_file": True}),  # write_file 要审批
+    ],
+    checkpointer=InMemorySaver(),              # ← HITL 必须配 checkpointer
+)
+
+config = {"configurable": {"thread_id": "approval-demo"}}
+
+# 1) 第一次调：模型决定调 write_file，Middleware 拦截，interrupt 暂停
+result = agent.invoke(
+    {"messages": [{"role": "user", "content": "把机密数据写进 /tmp/x.txt"}]},
+    config=config,
+    version="v2",                              # v2 协议能拿到 interrupts 字段
+)
+# result.interrupts 里有待审批动作（工具名、参数、description）
+
+# 2) 人工看完了，决定 approve
+agent.invoke(
+    Command(resume={"decisions": [{"type": "approve"}]}),
+    config=config,
+    version="v2",
+)
+# 图从断点续跑，write_file 真正执行
+```
+
+四种审批决策：`approve`（放行）、`edit`（改参数后放行）、`reject`（拒绝并告诉模型）、`respond`（不执行工具，回一句话让模型重新想）。
+
+<AgentDemoButton client:visible demoId="create-agent" label="运行：手写 35 行样板 vs create_agent 一键 + 审批" />
+
+上面的 Demo 对比了两种构建方式。左边手写 StateGraph 要 7 步组装、35 行样板，审批还得自己加 `interrupt_before` + `Command` 恢复逻辑；右边 `create_agent` 一行创建 + 一个 `HumanInTheLoopMiddleware`，interrupt 暂停、Command 恢复全由框架处理。**这就是「开箱即用」和「手写图」的真实价值差**。
+
+### 在工具内部直接 `interrupt()`（更细粒度）
+
+如果审批逻辑要嵌入工具内部（比如根据参数决定要不要暂停），可以直接调 `interrupt()`：
+
+```python
+from langgraph.types import interrupt, Command
+
+@tool
+def delete_records(table: str, condition: str) -> str:
+    """按条件删除表中记录。"""
+    # 调到一半暂停，把待执行动作交给客户端
+    decision = interrupt({
+        "action": "delete",
+        "table": table,
+        "condition": condition,
+        "needs": "人工确认是否真的要删",
+    })
+    # 恢复时，整个工具从头重跑，到这一行 interrupt() 返回客户端传的 resume 值
+    if decision == "approved":
+        return f"已删除 {table} 中满足 {condition} 的记录"
+    return f"已取消删除：{decision}"
+
+# 恢复
+agent.invoke(Command(resume="approved"), config=config)
+```
+
+`interrupt()` 的工作机制要记清：**首次调用**抛 `GraphInterrupt` 暂停图，`value` 发给客户端；**恢复时整个节点从头重跑**，跑到原来的 `interrupt()` 处不再抛异常，而是返回客户端传进来的 resume 值。所以工具里 `interrupt()` 后面的代码，在恢复时才会执行。
+
+> ⚠️ HITL 必须配 `checkpointer`——状态要持久化才能在 interrupt 后恢复。忘了配 checkpointer，interrupt 会直接报错。
+
+## token 级流式输出
+
+第 4 章的 `invoke` 是「等全部生成完才返回」，用户体验是干等。生产场景要 token 级流式——模型吐一个字、前端渲染一个字。LangGraph 的 `stream` 方法配合 `stream_mode="messages"` 就是干这个的：
+
+```python
+for chunk in agent.stream(
+    {"messages": [HumanMessage("用 200 字介绍 LangGraph")]},
+    stream_mode="messages",                    # ← token 级
+    version="v2",                              # v2 协议，chunk 是 StreamPart dict
+):
+    if chunk["type"] == "messages":
+        token, metadata = chunk["data"]
+        print(token.content, end="", flush=True)   # token.content 是增量文本
+```
+
+`stream_mode` 有几个常用的，理解它们的区别很重要：
+
+| mode | 吐什么 | 用途 |
+|---|---|---|
+| `"messages"` | 每个 token（`AIMessageChunk`） | **token 级流式渲染**（前端打字机效果） |
+| `"updates"` | 每个 agent step 后的状态更新 | 看每轮调了什么工具、状态怎么变 |
+| `"values"` | 整个 state 每次更新后的完整快照 | 调试、回放 |
+| `"custom"` | 节点/工具里用 `get_stream_writer()` 自定义吐数据 | 自定义事件（如进度条） |
+| `"debug"` | 执行轨迹 | 深度调试 |
+
+可以传列表同时拿多种：`stream_mode=["updates", "messages"]`，chunk 里带 `type` 字段区分。
+
+> 第 10 章「部署上线」会把这些 stream mode 接到 Web 前端——SSE 把 token 推给浏览器，前端逐字渲染。这正是本站交互式文章「流式回放」的工程基础。
+
+## 什么时候用 `create_agent`，什么时候手写图
+
+`create_agent` 适合**标准 ReAct 模式**——模型 ↔ 工具循环。预设的循环不够用时，就退回手写 `StateGraph`，或者把 `create_agent` 生成的图**当子图**嵌进更大的图：
+
+```python
+# 把 create_agent 生成的 agent 作为一个节点，嵌进自定义工作流
+from langgraph.graph import StateGraph, START, END
+
+research_agent = create_agent(model=model, tools=[search, write_file])
+
+builder = StateGraph(OverallState)
+builder.add_node("research", research_agent)       # ← 整个 agent 当一个节点
+builder.add_node("review", review_node)            # 自定义节点
+builder.add_edge(START, "research")
+builder.add_edge("research", "review")
+builder.add_edge("review", END)
+app = builder.compile(checkpointer=InMemorySaver())
+```
+
+`create_agent` 生成的图作为子图时，它内部的 middleware hook 跟着走。这就是「开箱即用」和「灵活定制」并存的办法——简单的用封装，复杂的退到手写，两者还能混搭。
+
+## 小结
+
+1. **`create_agent` 是 StateGraph 的预组装便捷层**：一行创建标准 ReAct Agent，内部干的事和第 4 章手写一样。返回 `CompiledStateGraph`，checkpointer / `get_state_history` / 作为子图全可用。
+2. **迁移要点**：旧 `create_react_agent` 已废弃，换 `create_agent`；`prompt=` → `system_prompt=`；`pre/post_model_hook` → `middleware=[...]`。
+3. **Middleware 把横切逻辑从业务里抽出去**：审批、重试、限流、摘要、任务规划都做成可插拔中间件，业务循环保持干净。`SummarizationMiddleware` 解上下文膨胀，`ToolCallLimitMiddleware` 解死循环——第 3 章的痛点有了现成解药。
+4. **HITL 审批两种写法**：`HumanInTheLoopMiddleware`（按工具名拦截，最省事）或工具内部 `interrupt()`（细粒度）。恢复用 `Command(resume=...)`，必须配 checkpointer。
+5. **token 级流式用 `stream_mode="messages"`**：`chunk["data"]` 拿 `(token, metadata)`，`token.content` 是增量文本。`updates` / `values` / `custom` 等 mode 各有用途，第 10 章会接到 Web 前端。
+
+> 至此 LangGraph 篇收尾。你能用 `StateGraph` 手写图，也能用 `create_agent` 一键封装，还会加审批和流式。但第 3 章的「上下文工程」痛点，`SummarizationMiddleware` 只是缓解——真正把它做成一等公民的，是第 6 章的 Deep Agents：虚拟文件系统、子 Agent、长期记忆，把生产级 Harness 该有的能力打包好。
