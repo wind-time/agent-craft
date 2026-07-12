@@ -1,0 +1,58 @@
+{
+  "demoId": "handcraft-react",
+  "variants": [
+    {
+      "id": "react",
+      "label": "手搓 ReAct 多轮循环",
+      "steps": [
+        {
+          "type": "thought",
+          "content": "[轮 1] 要算温差，得先知道两地温度。先查北京。"
+        },
+        {
+          "type": "tool_call",
+          "toolName": "get_weather",
+          "content": "get_weather(city='北京')  # id=call_1"
+        },
+        {
+          "type": "thought",
+          "content": "工具返回：晴，28°C（作为 ToolMessage 回填进 messages）。"
+        },
+        {
+          "type": "thought",
+          "content": "[轮 2] 北京 28°C。还差上海的温度。"
+        },
+        {
+          "type": "tool_call",
+          "toolName": "get_weather",
+          "content": "get_weather(city='上海')  # id=call_2"
+        },
+        {
+          "type": "thought",
+          "content": "工具返回：多云，25°C（作为 ToolMessage 回填进 messages）。"
+        },
+        {
+          "type": "thought",
+          "content": "[轮 3] 北京 28°C、上海 25°C，现在算温差 28 - 25。"
+        },
+        {
+          "type": "tool_call",
+          "toolName": "subtract",
+          "content": "subtract(a=28, b=25)  # id=call_3"
+        },
+        {
+          "type": "thought",
+          "content": "工具返回：3（作为 ToolMessage 回填进 messages）。"
+        },
+        {
+          "type": "thought",
+          "content": "[轮 4] 温差是 3°C，可以回答了。"
+        },
+        {
+          "type": "output",
+          "content": "北京今天 28°C，上海 25°C，北京比上海高 3°C。"
+        }
+      ]
+    }
+  ]
+}

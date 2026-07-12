@@ -1,0 +1,256 @@
+---
+title: "手搓 ReAct 循环：不靠框架，亲身体会 Agent 的运行机制与三个痛点"
+pubDatetime: 2026-07-12T00:00:00Z
+featured: false
+draft: false
+tags: [agent, langchain, react]
+description: "上一章我们跑通了单轮 tool call。本章把那个三步法套进 while 循环，不靠任何 Agent 框架，自己手搓一个能多轮调工具的 ReAct Agent——然后亲身体会裸循环走不远的三个痛点。"
+---
+
+import AgentDemoButton from "@/components/_interactive/AgentDemoButton.tsx";
+
+> 上一章我们用 `bind_tools` 跑通了单轮 tool call——模型说「我要调工具」、代码执行、回填结果、再问一次拿答案。但真实任务往往要多轮。本章把那个三步法套进 `while` 循环，不靠任何 Agent 框架，自己手搓一个 ReAct Agent。
+
+## 从单轮到多轮：差一个 while
+
+回顾第 2 章的单轮闭环，三步：
+
+1. 模型输出 `tool_calls`
+2. 代码执行工具，回填 `ToolMessage`
+3. 再 invoke 拿最终答案
+
+单轮任务在第 3 步就结束了。但如果任务需要多次调工具呢？比如「北京和上海今天温差多少度」——模型得先查北京、再查上海、再算减法，至少三轮。这时只要把三步法套进循环：
+
+```text
+while True:
+    ai_msg = model_with_tools.invoke(messages)
+    messages.append(ai_msg)
+    if not ai_msg.tool_calls:        # 模型不再调工具 → 给出最终答案
+        break
+    for tc in ai_msg.tool_calls:
+        messages.append(执行工具(tc))
+print(messages[-1].text)
+```
+
+这就是 **ReAct 模式**——**Rea**son（思考）→ **Act**（行动，调工具）→ **Observe**（观察工具结果），循环往复，直到模型觉得「不用再调工具了，可以回答」。
+
+看起来确实「只是个 while 循环」。第 1 章我们也说过这句话只对了一半。本章我们就亲手把它跑起来，然后在跑的过程中，让你**亲眼看到**那「另一半」——循环本身管不了的三件事。
+
+## 最小可运行的手搓 ReAct
+
+先定义两个工具——查天气、做减法。一个对外获取信息，一个对内做计算，是 Agent 最典型的两类工具。
+
+```python
+import os
+from dotenv import load_dotenv
+from langchain.chat_models import init_chat_model
+from langchain.tools import tool
+from langchain.messages import HumanMessage
+
+load_dotenv()
+
+@tool
+def get_weather(city: str) -> str:
+    """获取指定城市的实时天气信息。
+
+    Args:
+        city: 城市名，例如 "北京"
+    """
+    fake = {"北京": "晴，28°C", "上海": "多云，25°C"}
+    return fake.get(city, f"{city}: 暂无数据")
+
+@tool
+def subtract(a: int, b: int) -> int:
+    """计算两个整数的差 a - b。
+
+    Args:
+        a: 被减数
+        b: 减数
+    """
+    return a - b
+
+# 工具名 → 工具对象的映射，后面按 name 分发用
+TOOL_MAP = {t.name: t for t in [get_weather, subtract]}
+
+model = init_chat_model(
+    f"openai:{os.environ['MODEL_NAME']}",
+    base_url=os.environ["BASE_URL"],
+    api_key=os.environ["API_KEY"],
+    temperature=0,
+)
+model_with_tools = model.bind_tools(list(TOOL_MAP.values()))
+```
+
+然后是核心的 ReAct 循环：
+
+```python
+def run_react(question: str, max_turns: int = 10) -> str:
+    messages = [HumanMessage(question)]
+
+    for turn in range(max_turns):                  # ← 护栏：循环上限
+        # (1) Reason + Act：模型思考并决定调什么工具
+        ai_msg = model_with_tools.invoke(messages)
+        messages.append(ai_msg)
+
+        # 模型不再请求工具 → 已给出最终答案，退出循环
+        if not ai_msg.tool_calls:
+            return ai_msg.text
+
+        # (2) Observe：执行工具，把结果回填进 messages
+        for tc in ai_msg.tool_calls:
+            tool_fn = TOOL_MAP[tc["name"]]         # 按 name 分发到对应工具
+            tool_msg = tool_fn.invoke(tc)          # 返回 ToolMessage，id 已对齐
+            messages.append(tool_msg)
+            print(f"[轮 {turn + 1}] {tc['name']}({tc['args']}) → {tool_msg.content}")
+
+    # 走到这里说明达到循环上限仍未完成
+    raise RuntimeError(f"达到循环上限 {max_turns} 仍未完成")
+
+# 跑一个需要三轮工具调用的任务
+print(run_react("北京和上海今天温差多少度？"))
+# [轮 1] get_weather({'city': '北京'}) → 晴，28°C
+# [轮 2] get_weather({'city': '上海'}) → 多云，25°C
+# [轮 3] subtract({'a': 28, 'b': 25}) → 3
+# 北京今天 28°C，上海 25°C，北京比上海高 3°C。
+```
+
+<AgentDemoButton client:visible demoId="handcraft-react" label="运行：手搓 ReAct 多轮循环" />
+
+上面的 Demo 回放了这整个循环过程——四轮里前三轮各调一次工具，第四轮模型拿到所有信息后给出最终答案。注意每轮的 trace 都遵循 **Thought → tool_call → Observation** 的节奏，这正是 ReAct 的运行骨架。
+
+## 拆解这个循环在做什么
+
+### 终止条件：`if not ai_msg.tool_calls`
+
+这是整个循环的「心跳」。模型每一轮都会输出 `tool_calls`，直到它判断「信息够了，不用再调工具」，这一轮的 `tool_calls` 就是空列表 `[]`，循环退出，返回 `ai_msg.text`。
+
+> 关键认知：**Agent 的终止不是你决定的，是模型自己决定的**。你只提供工具和循环，模型决定什么时候调、调几次、何时停。这带来了第 1 章说的「提前停」或「不停」的风险——后面会看到。
+
+### 工具分发：`TOOL_MAP[tc["name"]]`
+
+模型一轮可能调多个工具，每个 `tool_call` 里的 `name` 告诉你该执行哪个。用 `TOOL_MAP` 做按名分发，比一长串 `if/elif` 干净。
+
+### 护栏：`max_turns`
+
+`for turn in range(max_turns)` 而不是 `while True`——这是手搓循环**唯一**的护栏。没有它，一旦模型陷入「反复调同一个工具」的死循环，你的程序就永远停不下来，token 还在烧。`max_turns` 是兜底，不是解决方案（后面会讲为什么）。
+
+## 亲身体会：循环管不了的三件事
+
+跑通了基础版，现在制造三个故障场景，让你看到裸循环的真实痛点。这三个痛点正是第 4 章 LangGraph 要解决的。
+
+### 痛点 1：上下文单向膨胀，无人管理
+
+每跑一轮，`messages` 就长一截：用户的提问、模型的思考、`AIMessage`（含 `tool_calls`）、`ToolMessage`（含结果），全往里塞。
+
+```text
+轮 1: [user, ai(tool_calls), tool]            # 4 条
+轮 2: [user, ai, tool, ai(tool_calls), tool]  # 6 条
+轮 3: [user, ai, tool, ai, tool, ai, tool, ai(tool_calls), tool]  # 9 条
+...
+```
+
+跑个十几轮，消息列表可能几千 token。问题：
+
+- **成本飙升**：每轮都把全部历史发给模型，token 按总量计费
+- **超限报错**：超过模型上下文窗口直接 400 错误
+- **失忆**：有些模型会把早期消息「挤出去」，导致关键信息丢失，模型开始答非所问
+
+而你的循环对此**毫无办法**——它只知道无脑 append。什么时候该压缩、该总结、该外置到文件，循环结构里根本没有这层。
+
+> 你可以把上下文想象成 Agent 的**工作台**。裸循环是「把所有东西都摊在台子上」，台子塞满了就崩。上下文工程是「学会把资料分类放进抽屉，需要时再取」——但那不是循环能解决的，是一个独立的工程问题。
+
+### 痛点 2：进程一崩，全部状态丢失
+
+手搓循环的 `messages` 是个内存里的 Python 列表。现在想象这些情况：
+
+- 用户聊到一半网络断了
+- 服务器重启了
+- 某一轮工具抛了异常，循环挂了
+- 你想「回到第 3 轮重新跑一次试试别的工具」
+
+**所有状态全没了**。`messages` 在内存里，进程一死就清零。用户只能从头再来，模型重新推理、重新调工具、重新烧 token。
+
+生产级 Agent 需要**检查点**（checkpoint）：把状态持久化下来，能中断、能恢复、能「时间旅行」回退到某一步重跑。这是循环结构里完全没有的一层——你手搓的 `messages` 列表没有任何持久化机制。
+
+### 痛点 3：模型不听话，循环救不了
+
+模型不总是按你想的来。手搓循环会遇到这些「不听话」：
+
+| 故障 | 现象 | 循环能做什么 |
+|---|---|---|
+| **调不存在的工具** | `tc["name"]` 不在 `TOOL_MAP`，`KeyError` 崩溃 | 啥也做不了，直接挂 |
+| **传错参数** | 工具函数抛 `TypeError`/`ValueError` | 啥也做不了，异常冒泡崩溃 |
+| **死循环** | 反复调同一个工具，永远不停 | 只有 `max_turns` 兜底强行中断，但没真正解决 |
+| **提前停** | 信息没凑齐就说「我不知道」结束了 | 循环直接 return，毫无察觉 |
+
+裸循环对这些故障**要么崩，要么装作没发生**。真正的框架要给每一步加护栏：工具不存在时的兜底、参数校验、异常重试、循环检测。这些也不是「循环」本身能提供的——是循环之外的一层工程。
+
+## 给裸循环打补丁，能走多远？
+
+你可能会想：「这些痛点我自己加代码不就行了？」确实可以。但你会发现补丁越打越多：
+
+```python
+def run_react_hardened(question: str, max_turns: int = 10) -> str:
+    messages = [HumanMessage(question)]
+    seen_calls = set()   # ← 补丁 1：循环检测
+
+    for turn in range(max_turns):
+        ai_msg = model_with_tools.invoke(messages)
+        messages.append(ai_msg)
+
+        if not ai_msg.tool_calls:
+            return ai_msg.text
+
+        for tc in ai_msg.tool_calls:
+            # ← 补丁 2：工具不存在兜底
+            if tc["name"] not in TOOL_MAP:
+                messages.append({
+                    "role": "tool",
+                    "content": f"错误：工具 {tc['name']} 不存在",
+                    "tool_call_id": tc["id"],
+                })
+                continue
+
+            # ← 补丁 3：循环检测
+            call_key = (tc["name"], str(tc["args"]))
+            if call_key in seen_calls:
+                messages.append({
+                    "role": "tool",
+                    "content": "你已经调过这个了，别重复调。",
+                    "tool_call_id": tc["id"],
+                })
+                continue
+            seen_calls.add(call_key)
+
+            # ← 补丁 4：异常捕获 + 重试
+            try:
+                tool_msg = TOOL_MAP[tc["name"]].invoke(tc)
+            except Exception as e:
+                tool_msg = ToolMessage(
+                    content=f"工具执行出错：{e}",
+                    tool_call_id=tc["id"],
+                )
+            messages.append(tool_msg)
+
+    raise RuntimeError(f"达到循环上限 {max_turns} 仍未完成")
+```
+
+打完四个补丁，代码已经从 15 行膨胀到 40 多行，而且还没解决：
+
+- 上下文膨胀（要写压缩逻辑）
+- 状态持久化（要接数据库存 `messages`）
+- 流式输出（要改成 async + 事件推送）
+- 并发子任务（要拆成多个循环协调）
+- 可观测（要给每步打 trace 上报 LangSmith）
+
+每加一个能力，这个函数就更臃肿、更难维护。**这就是框架存在的理由**——把这些横切关注点从你的业务循环里抽出去，变成可组合的基础设施。
+
+## 小结
+
+1. **ReAct = Reason → Act → Observe 的循环**。把第 2 章的单轮三步法套进 `while`，就是最小可运行的 Agent。终止条件是 `if not ai_msg.tool_calls`——模型自己决定何时停。
+2. **工具分发靠 `TOOL_MAP`**，按 `tool_call.name` 路由到对应工具，比 `if/elif` 干净。
+3. **`max_turns` 是裸循环唯一的护栏**，只能兜底防死循环，解决不了根本问题。
+4. **循环管不了的三件事**：上下文单向膨胀（无人管理）、进程崩状态全丢（无检查点）、模型不听话（无护栏恢复）——这正是第 4 章 LangGraph 要解决的。
+5. **打补丁走不远**：每个能力都让循环更臃肿，最终你会重写出一个小框架——不如直接用现成的。
+
+> 下一章，我们用 LangGraph 的 `StateGraph` 重写这个 ReAct 循环。你会看到同样的「思考→行动→观察」逻辑，如何用节点和边表达，以及 StateGraph 自带的 Checkpointer 如何一口气解决「状态丢失」这个痛点。
