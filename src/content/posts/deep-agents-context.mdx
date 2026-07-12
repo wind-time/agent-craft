@@ -1,0 +1,212 @@
+---
+title: "第 6 章 · Deep Agents：Context Engineering 与虚拟文件系统"
+pubDatetime: 2026-07-12T00:00:00Z
+chapter: 6
+featured: false
+draft: false
+tags: [agent, deepagents, context-engineering]
+description: "从第 3 章到现在，「上下文膨胀」一直只是被缓解——SummarizationMiddleware 压一压、ToolCallLimit 卡一下。本章上 Deep Agents：把虚拟文件系统做成一等公民，让 Agent 把中间结果外置到文件、按需取回，真正实现 Context Engineering。"
+---
+
+import AgentDemoButton from "@/components/_interactive/AgentDemoButton.tsx";
+
+> 从第 3 章手搓 ReAct 暴露「上下文单向膨胀」痛点开始，这个痛点一直只被缓解——第 5 章的 `SummarizationMiddleware` 压一压旧消息、`ToolCallLimitMiddleware` 卡一下次数。本章上 Deep Agents：它把虚拟文件系统做成一等公民，让 Agent 把中间结果外置到文件、按需取回，这才是真正的 Context Engineering。
+
+## 还没解决的痛点：上下文是张「会满的桌子」
+
+回顾第 3 章那张图——上下文像 Agent 的工作台，裸循环是「把所有东西都摊在台子上」，台子塞满了就崩。前五章我们给它加了不少东西，但都没动这个核心问题：
+
+| 章 | 对上下文膨胀做了什么 |
+|---|---|
+| 3 手搓 ReAct | 啥也没做，无脑 append |
+| 4 StateGraph | 还是无脑 append，但状态能持久化了 |
+| 5 create_agent | `SummarizationMiddleware` 压缩旧消息（缓解，不解决） |
+
+`SummarizationMiddleware` 的局限：它是「事后压缩」——资料先进了上下文、占满了才压缩。压缩还会丢信息，关键细节可能被摘要掉。**真正该做的是「事前外置」**：资料一开始就别进上下文，放到一个 Agent 能读写、但不占消息列表的地方。
+
+这正是 Deep Agents 的核心思路：给 Agent 一个**虚拟文件系统**，让它像人用电脑一样——查到的资料存成文件，要用时再 `read_file` 取回，工作台（messages）始终干净。
+
+## Deep Agents 是什么
+
+**Deep Agents** 是 LangChain 官方的「opinionated harness」（开箱即用的成套方案），构建在 `create_agent` 之上，而 `create_agent` 又构建在 LangGraph 之上。三层栈：
+
+```text
+LangGraph（Runtime：状态图、checkpointer、流式）
+    ↑
+langchain.agents.create_agent（Framework：标准 ReAct 封装）
+    ↑
+deepagents.create_deep_agent（Harness：文件系统、子 Agent、记忆、Skills）
+```
+
+> 你可以把这三层对应回第 1 章的「三个层次」：Runtime → Framework → Harness。Deep Agents 就是 Harness 层的代表——发动机和变速箱都装好了，连导航、变道、避障都帮你做了，你只说目的地。
+
+### 安装
+
+```bash
+# pip
+pip install deepagents
+
+# uv（推荐）
+uv add deepagents
+```
+
+> 本文基于 **deepagents 0.6.x**（稳定版 0.6.12，2026-06 发布）。注意这是 Beta 阶段的包，API 还在变动——导入路径以 `deepagents` / `deepagents.middleware` / `deepagents.backends` 三个顶层为准。Python 要求 3.11+。
+
+## 一行创建 Deep Agent
+
+`create_deep_agent` 的最小调用和 `create_agent` 几乎一样，但默认就带了一整套能力：
+
+```python
+from deepagents import create_deep_agent
+
+agent = create_deep_agent(
+    model="openai:your-model-name",          # 任意 init_chat_model 支持的 provider:model
+    tools=[search],                           # 你的业务工具（可选）
+    system_prompt="你是一个研究助手，把中间结果存成文件，别堆在对话里。",
+)
+```
+
+就这一行，Agent 已经自动拥有了：
+
+| 能力 | 怎么来的 | 对应第 3 章痛点 |
+|---|---|---|
+| 虚拟文件系统（`write_file`/`read_file`/`ls`/`grep`...） | 默认 `FilesystemMiddleware` | 上下文膨胀 ✅ |
+| 任务规划（`write_todos`） | 默认 `TodoListMiddleware` | 复杂任务拆解 |
+| 历史压缩 | 默认 `SummarizationMiddleware` | 上下文膨胀（兜底） |
+| 子 Agent 委派（`task`） | 传 `subagents=` 时挂上 | 上下文隔离（第 7 章） |
+| 技能渐进加载 | 传 `skills=` 时挂上 | 能力复用（第 8 章） |
+| 长期记忆 | 传 `memory=` 时挂上 | 跨会话沉淀（第 8 章） |
+
+对比第 5 章用 `create_agent` 时——这些你得一个一个手装 middleware。Deep Agents 默认就给你配好了。
+
+> **和 `create_agent` 的关系**：`create_deep_agent` 返回的也是 `CompiledStateGraph`，所以第 4、5 章学的 checkpointer、`get_state_history`、`interrupt_on`、`stream` 全部能用。它不是另起炉灶，是 `create_agent` 之上的「预配置 + 加料」。
+
+## 核心：虚拟文件系统
+
+这是 Deep Agents 的灵魂。**默认就启用**，不用传参——`FilesystemMiddleware` 已经在默认 middleware 栈里，用 `StateBackend`（存在 LangGraph state 内，同 thread 跨轮次持久）。
+
+### Agent 自动拥有的文件工具
+
+启用后，Agent 会自动多出这一套工具（你不用定义，框架注入）：
+
+| 工具 | 用途 |
+|---|---|
+| `write_file` | 创建/覆盖文件 |
+| `read_file` | 读文件，带行号，支持 offset/limit |
+| `edit_file` | 精确字符串替换 |
+| `ls` | 列目录 |
+| `glob` | 按 `**/*.py` 模式找文件 |
+| `grep` | 搜文件内容 |
+
+有了这套工具，Agent 就能像人用电脑一样管理资料：查到的资料 `write_file` 存起来，要用时 `read_file` 或 `grep` 取回，工作台（messages）始终干净。
+
+### 最小示例：Agent 自己存文件再读
+
+```python
+from deepagents import create_deep_agent
+
+agent = create_deep_agent(
+    model="openai:your-model-name",
+    system_prompt="你需要持久化中间结果到文件，而不是堆在对话里。",
+)
+
+result = agent.invoke({
+    "messages": "把'你好，世界'写进 /tmp/note.txt，然后读出来确认。",
+})
+# Agent 会自主决定：先调 write_file，再调 read_file，最后回复确认
+print(result["messages"][-1].content)
+```
+
+注意：你**没有定义** `write_file` 和 `read_file`——它们是文件系统中间件自动注入的。Agent 自己决定什么时候存、什么时候取。
+
+### 后端：文件存在哪
+
+虚拟文件系统的「文件」存在后端里，不同后端对应不同存储：
+
+| 后端 | 导入 | 用途 |
+|---|---|---|
+| `StateBackend` | `from deepagents.backends import StateBackend` | **默认**。存在 LangGraph state 内，同 thread 跨轮次持久 |
+| `FilesystemBackend` | `from deepagents.backends import FilesystemBackend` | 本地真实磁盘，`root_dir=` 指定根 |
+| `StoreBackend` | `from deepagents.backends import StoreBackend` | LangGraph `BaseStore`，**跨 thread 持久** |
+| `LangSmithSandbox` | `from deepagents.backends import LangSmithSandbox` | 沙箱执行（含 shell） |
+
+换后端只需传 `backend=`：
+
+```python
+from deepagents import create_deep_agent
+from deepagents.backends import FilesystemBackend
+
+agent = create_deep_agent(
+    model="openai:your-model-name",
+    backend=FilesystemBackend(root_dir="./agent-workspace"),  # 真实磁盘
+)
+```
+
+> 生产场景通常用 `StoreBackend`（跨会话持久）或 `LangSmithSandbox`（隔离执行）。本章示例用默认 `StateBackend` 即可，零配置。
+
+## Context Engineering：把工作台变干净
+
+现在看 Deep Agents 怎么真正解决上下文膨胀。对比同一个任务——「调研三个主题，汇总成报告」：
+
+<AgentDemoButton client:visible demoId="deep-agents-context" label="运行：普通 agent 上下文膨胀 vs Deep Agent 外置到文件" />
+
+上面的 Demo 对比了两种执行轨迹：
+
+- **左边普通 agent**：每个 `search` 的结果（几百 token）全堆进 `messages`，三轮后 messages 累计几千 token，汇总时模型要把全部历史资料重读一遍。再多查几个主题就会超窗口报错。
+- **右边 Deep Agent**：每个 `search` 结果立刻 `write_file` 外置到文件系统，主上下文只多一条「已写入 xxx.md」。汇总时 `read_file` 按需取回需要的片段。**主上下文始终低水位**。
+
+```python
+# Deep Agent 的典型上下文管理流程
+agent = create_deep_agent(
+    model="openai:your-model-name",
+    system_prompt="""你是一个研究助手。收到大量资料时：
+1. 先 write_file 存成文件，不要留在对话里
+2. 汇总时再 read_file 按需取回
+3. 只把最终结论留在对话里""",
+)
+
+result = agent.invoke({
+    "messages": "调研 LangGraph / Deep Agents / MCP 三个主题，各查要点后汇总成报告。",
+})
+# Agent 会自主执行：
+# search("LangGraph 要点") → write_file("/research/langgraph.md", ...)
+# search("Deep Agents 要点") → write_file("/research/deepagents.md", ...)
+# search("MCP 要点") → write_file("/research/mcp.md", ...)
+# read_file("/research/langgraph.md") → 只取需要的片段
+# ... 最终输出报告，主上下文始终干净
+```
+
+### 三套机制叠加
+
+Deep Agents 解决上下文膨胀不是靠单一招，而是三套机制配合：
+
+1. **虚拟文件系统外置中间结果**——核心。资料进文件不进 messages，主上下文保持干净。
+2. **`SummarizationMiddleware` 自动压缩**——兜底。万一上下文还是涨上来（比如很长的单条消息），自动压缩旧消息。这是「事后」补救，和文件系统的「事前」外置互补。
+3. **子 Agent 上下文隔离**——第 7 章细讲。子 Agent 跑完只回传最终结果，中间消息不进主上下文。
+
+> 这正是第 1 章那个类比的落地：上下文工程是「学会把资料分类放进抽屉，需要时再取」。文件系统是抽屉，`SummarizationMiddleware` 是定期整理台面，子 Agent 是把一堆活外包出去只收回成品。三者叠加，工作台才能在长任务里保持不崩。
+
+## 和普通 Agent 的对照
+
+| 维度 | `create_agent`（第 5 章） | `create_deep_agent`（本章） |
+|---|---|---|
+| 内置工具 | 只有你传的 `tools` | 自带文件系统全套 + `write_todos` + `task`（子 Agent） |
+| 默认 middleware | 几乎空 | TodoList / Filesystem / Summarization / PromptCaching 等 7+ 项 |
+| 文件系统 | 无 | 默认启用，`StateBackend` 开箱即用 |
+| 子 Agent | 手搓 | `subagents=[...]` 一行声明 |
+| 记忆 | 手搓 | `memory=[...]` 一行 |
+| Skills 渐进加载 | 无 | `skills=[...]` 一行 |
+| 权限控制 | 无 | `permissions=[...]` 一行，按路径 allow/deny/interrupt |
+| 省下的样板 | — | 文件系统 + todo + 子 Agent + 压缩 + caching 全部 |
+
+一句话：Deep Agent = 普通 Agent + 一套「长任务执行体」开箱即用。你只写业务工具和提示词，生产级能力全配好了。
+
+## 小结
+
+1. **Deep Agents 是 Harness 层**：构建在 `create_agent`（Framework）之上，后者又构建在 LangGraph（Runtime）之上——对应第 1 章的三个层次。返回 `CompiledStateGraph`，前面学的 checkpointer / 流式 / interrupt 全能用。
+2. **虚拟文件系统默认启用**：`FilesystemMiddleware` + `StateBackend` 开箱即用，自动注入 `write_file`/`read_file`/`ls`/`grep` 等工具，Agent 像人用电脑一样管理资料。
+3. **Context Engineering = 事前外置 + 事后压缩 + 上下文隔离**：文件系统把资料外置（核心）、`SummarizationMiddleware` 压缩兜底、子 Agent 隔离中间消息——三套机制叠加，让主上下文在长任务里始终不崩。这才是第 3 章痛点的真正解药。
+4. **后端决定文件存哪**：`StateBackend`（默认，同 thread 持久）/ `FilesystemBackend`（本地磁盘）/ `StoreBackend`（跨 thread 持久）/ `LangSmithSandbox`（沙箱）。换后端只改一行 `backend=`。
+5. **Deep Agent = 普通 Agent + 长任务执行体**：文件系统、todo、子 Agent、压缩、记忆、Skills、权限全部开箱即用，你只写业务工具和提示词。
+
+> 下一章深入 Deep Agents 的进阶能力——任务规划（`write_todos`）与子 Agent 编排。子 Agent 怎么把一个复杂任务拆成多个独立子任务并发执行、每个子 Agent 的上下文如何与主 Agent 隔离（Context Quarantine），让主 Agent 在调度多个子任务时依然保持上下文干净。
