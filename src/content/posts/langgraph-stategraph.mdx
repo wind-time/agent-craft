@@ -1,0 +1,256 @@
+---
+title: "LangGraph：用图重写 ReAct，StateGraph + Checkpointer 一次解决状态丢失"
+pubDatetime: 2026-07-12T00:00:00Z
+featured: false
+draft: false
+tags: [agent, langchain, langgraph]
+description: "上一章手搓 ReAct 暴露了三个痛点，最扎心的是「进程一崩状态全丢」。本章用 LangGraph 的 StateGraph 把那个 while 循环重写成节点和边，再用 Checkpointer 给状态加持久化——一次解决时间旅行、中断恢复、fork 重跑。"
+---
+
+import AgentDemoButton from "@/components/_interactive/AgentDemoButton.tsx";
+
+> 上一章我们手搓了 ReAct 循环，亲眼看到它跑着跑着就崩——进程一死，内存里的 `messages` 列表全丢。本章用 LangGraph 的 `StateGraph` 把那个循环重写成「节点 + 边」，再用 `Checkpointer` 给状态加持久化，一口气解决「状态丢失」这个痛点。
+
+## 为什么不用 while，要用图
+
+手搓循环的问题，本质是**控制流和状态搅在一起**：
+
+- 控制流（「下一步该干啥」）藏在 `while` + `if not tool_calls` 里，难以可视化、难以插节点
+- 状态（`messages`）是个裸 list，没有持久化、没有 reducer、没有历史
+
+LangGraph 把这两件事拆开：**用图表达控制流，用 State + reducer 表达状态**。一个 Agent 就是这样一张图：
+
+```text
+START → agent ─┐
+               ↓（有 tool_calls）
+              tools
+               ↑
+               └（回到 agent 再思考）
+agent → END（无 tool_calls）
+```
+
+`agent` 节点调模型、`tools` 节点执行工具、条件边根据 `tool_calls` 决定去 `tools` 还是 `END`。这跟第 3 章的 while 循环是同一个逻辑，但结构清晰得多——而且图上每个节点执行后，Checkpointer 都会自动存一份状态。
+
+## 环境准备
+
+```bash
+# pip
+pip install -U langgraph langchain langchain-openai
+
+# uv（推荐）
+uv pip install -U langgraph langchain langchain-openai
+```
+
+> 本文基于 **LangGraph 1.2.x**（独立包，和 `langchain` 版本解耦）、`langchain` 1.3.x。注意 1.x 的两个 breaking change：旧代码里的 `MemorySaver` 已规范命名为 `InMemorySaver`；`MessageGraph` 已弃用，统一用 `StateGraph` + `messages` 键。
+
+## 第一块：State 与 reducer
+
+手搓循环里 `messages` 是个裸 list，`append` 是唯一的「合并」方式。StateGraph 里 State 是个 `TypedDict`，每个字段配一个 **reducer**——告诉框架「新值和旧值怎么合并」。
+
+```python
+from typing import Annotated
+from typing_extensions import TypedDict
+from langgraph.graph import add_messages
+
+class State(TypedDict):
+    # add_messages 是 reducer：新消息按 ID 合并（同 ID 替换、新 ID 追加）
+    messages: Annotated[list, add_messages]
+```
+
+> 为什么不直接用 `list.append`？因为有些场景新消息要**替换**旧消息（比如修正一条刚写的消息），靠 ID 合并比无脑追加更稳。这也是 `ToolMessage` 能对齐到正确的 `tool_call_id` 的基础。
+
+嫌手写 State 麻烦，可以用内置的 `MessagesState`（等价于上面这个定义）：
+
+```python
+from langgraph.graph import MessagesState
+
+class State(MessagesState):
+    pass  # 只需要 messages 一个字段时，直接继承即可
+```
+
+## 第二块：节点与边
+
+节点就是一个普通函数：接收 state，返回**对 state 的局部更新**（一个 dict），框架靠 reducer 合并。
+
+```python
+import os
+from dotenv import load_dotenv
+from langchain.chat_models import init_chat_model
+from langchain.tools import tool
+from langchain.messages import HumanMessage
+from langgraph.graph import StateGraph, START, END
+
+load_dotenv()
+
+# 工具（沿用第 3 章的两个）
+@tool
+def get_weather(city: str) -> str:
+    """获取指定城市的实时天气信息。"""
+    fake = {"北京": "晴，28°C", "上海": "多云，25°C"}
+    return fake.get(city, f"{city}: 暂无数据")
+
+@tool
+def subtract(a: int, b: int) -> int:
+    """计算两个整数的差 a - b。"""
+    return a - b
+
+tools = [get_weather, subtract]
+model = init_chat_model(
+    f"openai:{os.environ['MODEL_NAME']}",
+    base_url=os.environ["BASE_URL"],
+    api_key=os.environ["API_KEY"],
+    temperature=0,
+)
+model_with_tools = model.bind_tools(tools)
+
+# agent 节点：调模型，返回「新增的 AI 消息」
+def agent(state: State):
+    ai_msg = model_with_tools.invoke(state["messages"])
+    return {"messages": [ai_msg]}          # ← 局部更新，add_messages 会自动合并
+```
+
+`tools` 节点可以用 LangGraph 自带的 `ToolNode`，自动处理并行 tool_calls 和 `tool_call_id` 对齐：
+
+```python
+from langgraph.prebuilt import ToolNode
+
+tool_node = ToolNode(tools)               # 直接复用，不用手写分发逻辑
+```
+
+条件边靠一个**路由函数**决定去向——它接收 state，返回下一个节点名：
+
+```python
+from typing import Literal
+
+def should_continue(state: State) -> Literal["tools", "__end__"]:
+    last_message = state["messages"][-1]
+    if last_message.tool_calls:           # 模型还要调工具 → 去 tools 节点
+        return "tools"
+    return END                            # 不调了 → 结束（END == "__end__"）
+```
+
+## 第三块：组装、编译、调用
+
+把节点和边连起来，`compile()` 之后得到一个可调用的图：
+
+```python
+builder = StateGraph(State)
+builder.add_node("agent", agent)
+builder.add_node("tools", tool_node)
+builder.add_edge(START, "agent")                       # 入口 → agent
+builder.add_conditional_edges("agent", should_continue, ["tools", END])
+builder.add_edge("tools", "agent")                    # 工具结果 → 回 agent 再思考
+
+app = builder.compile()                                # ← 先不加 checkpointer
+
+result = app.invoke({"messages": [HumanMessage("北京和上海今天温差多少度？")]})
+print(result["messages"][-1].text)
+# 北京今天 28°C，上海 25°C，北京比上海高 3°C。
+```
+
+跑起来，行为和第 3 章的手搓 ReAct 一模一样——四轮、调三个工具、给出答案。但代码结构清晰得多：控制流在 `add_edge` / `add_conditional_edges` 里，状态在 State + reducer 里，业务逻辑在节点函数里，三者解耦。
+
+## 第四块：Checkpointer——解决「状态丢失」
+
+现在上本章的重头戏。给 `compile()` 传一个 `checkpointer`，图执行时每经过一个节点都会**自动存一份 checkpoint**。
+
+```python
+from langgraph.checkpoint.memory import InMemorySaver
+
+checkpointer = InMemorySaver()              # 演示用内存版；生产换 PostgresSaver
+app = builder.compile(checkpointer=checkpointer)
+
+# 带 checkpointer 时，invoke 必须传 thread_id
+config = {"configurable": {"thread_id": "thread-1"}}
+result = app.invoke(
+    {"messages": [HumanMessage("北京和上海今天温差多少度？")]},
+    config,                                  # ← 传 config
+)
+```
+
+`thread_id` 是会话的标识。**同一个 thread_id 再次 invoke，会累积之前的对话**——这就是「记忆」：
+
+```python
+# 第二轮对话，接着上一轮问
+result2 = app.invoke(
+    {"messages": [HumanMessage("那深圳呢？")]},
+    config,                                  # 同一个 thread_id
+)
+# 模型知道「那深圳呢」指的是「深圳的温差」，因为上一轮的 messages 还在 checkpoint 链里
+```
+
+### 中断恢复
+
+这是和手搓循环最大的区别。想象服务跑到第 3 轮被重启了——手搓循环的 `messages` 全丢；StateGraph 呢？
+
+```python
+# 模拟中断：只跑到第 2 轮就停（用 interrupt 或直接 kill 进程）
+# ……进程重启后……
+# 用同一个 thread_id 继续调用，Checkpointer 读回上次的状态，从断点续跑
+result = app.invoke(None, config)            # ← 传 None 表示「没有新输入，从断点继续」
+```
+
+`invoke(None, config)` 的语义是「不输入新数据，从该 thread 的最新 checkpoint 续跑」。对用户来说，就像服务从没中断过。
+
+### 时间旅行
+
+Checkpointer 存的不只是最新状态，而是**整条 checkpoint 链**。`get_state_history` 能列出来，最新的在前：
+
+```python
+for snapshot in app.get_state_history(config):
+    cid = snapshot.config["configurable"]["checkpoint_id"]
+    print(cid, "→ 下一步:", snapshot.next, "来源:", snapshot.metadata.get("source"))
+# checkpoint-5 → 下一步: ()      来源: loop        （已完成）
+# checkpoint-4 → 下一步: ('agent',) 来源: loop
+# checkpoint-3 → 下一步: ('tools',) 来源: loop      （算温差前）
+# checkpoint-2 → 下一步: ('agent',) 来源: loop
+# checkpoint-1 → 下一步: ('agent',) 来源: input
+```
+
+回到任意一步「改输入重跑」，叫 **fork**——`update_state` 在某个历史 checkpoint 上写入新值，生成一个**新分支**，原 thread 不受影响：
+
+```python
+# 找到「查完上海后、算温差前」那个 checkpoint
+history = list(app.get_state_history(config))
+before_subtract = next(s for s in history if s.next == ("tools",))
+
+# fork：把上海的结果从 25°C 改成 30°C，看结论怎么变
+fork_config = app.update_state(
+    before_subtract.config,
+    {"messages": [{"role": "tool", "content": "多云，30°C",
+                   "tool_call_id": "call_2"}]},
+)
+
+# 从 fork 点续跑
+fork_result = app.invoke(None, fork_config)
+# 模型重新算：subtract(28, 30) → -2，结论变成「北京比上海低 2°C」
+# 原 thread-1 的结论「高 3°C」不受影响
+```
+
+<AgentDemoButton client:visible demoId="langgraph-stategraph" label="运行：手搓状态全丢 vs StateGraph 可恢复" />
+
+上面的 Demo 对比了两种执行轨迹。左边手搓循环跑到第 3 轮崩溃，`messages` 随进程蒸发，用户只能从头再跑；右边 StateGraph 跑到第 3 轮中断，但每个 checkpoint 都已落盘——用 thread_id 恢复续跑，还能 `get_state_history` 列全部历史、fork 回任意一步改输入重跑。**这就是图 + Checkpointer 给你的时间旅行能力**。
+
+## 还剩两个痛点没解决
+
+注意 StateGraph + Checkpointer 只解决了第 3 章三个痛点里的**第二个**（状态丢失）。另外两个还在：
+
+| 第 3 章痛点 | StateGraph 解决了吗 | 怎么解决 |
+|---|---|---|
+| 上下文单向膨胀 | ❌ 还没 | 上下文工程（第 6 章 Deep Agents） |
+| 进程崩状态全丢 | ✅ 已解决 | Checkpointer + thread_id |
+| 模型不听话（死循环/调错工具） | 🟡 部分 | 条件边能加路由逻辑，但兜底护栏还得自己写 |
+
+而且你会发现——**手写 StateGraph 还是挺繁琐**：定义 State、写 agent 节点、写 tools 节点、写路由函数、连边、compile……每次都来一遍。第 3 章手搓 ReAct 是 15 行，这里也差不多 30 行，而且样板代码占大头。
+
+这正是第 5 章的钩子：LangGraph 提供了 `create_react_agent`（注意：1.x 已迁到 `langchain.agents.create_agent`）这种**一键封装**，把 State + 节点 + 边全给你搭好，你只写工具和模型。但它还带来更值钱的东西——条件中断（人机协作审批）、流式输出、多节点自定义工作流。
+
+## 小结
+
+1. **图 vs while**：手搓循环把控制流和状态搅在 `messages` list 里；StateGraph 用「节点 + 边」表达控制流，用 `State + reducer` 表达状态，二者解耦，结构清晰、可可视化。
+2. **State 靠 reducer 合并**：`Annotated[list, add_messages]` 让新消息按 ID 合并（同 ID 替换、新 ID 追加），不是无脑 append——这是 `ToolMessage` 对齐 `tool_call_id` 的基础。
+3. **Checkpointer 是状态持久化的关键**：`InMemorySaver`（演示）/ `PostgresSaver`（生产）给图每个节点后自动存 checkpoint，`thread_id` 标识会话、同 id 复用即累积记忆。
+4. **中断恢复 + 时间旅行**：`invoke(None, config)` 从断点续跑；`get_state_history` 列全部历史；`update_state` + `invoke(None, fork_config)` 回到任意一步 fork 改输入重跑。手搓循环一个都做不到。
+5. **三个痛点只解决了一个**：上下文膨胀要等 Deep Agents，模型不听话要自己加护栏——StateGraph 给了你结构，没给你一切。手写图也还繁琐，第 5 章用一键封装 + 复杂编排收尾。
+
+> 下一章，我们用 `create_agent` 一条命令替代本章手写的整张图，再讲它带来的进阶能力——条件中断做「人机协作审批」、流式输出做 token 级渲染。你会看到「开箱即用」和「复杂编排」如何并存。
